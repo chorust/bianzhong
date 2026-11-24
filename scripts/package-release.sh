@@ -101,6 +101,7 @@ cp "$ROOT_DIR/dist/bz" "$TARROOT/bz"
 chmod 755 "$TARROOT/bz"
 cp -R "$ROOT_DIR/templates" "$TARROOT/templates"
 cp "$ROOT_DIR/README.md" "$TARROOT/README.md"
+[[ -f "$ROOT_DIR/README.en.md" ]] && cp "$ROOT_DIR/README.en.md" "$TARROOT/README.en.md"
 
 TAR_PATH="$RELEASE_DIR/${ARTIFACT_BASE}.tar.gz"
 COPYFILE_DISABLE=1 tar -czf "$TAR_PATH" -C "$STAGE_DIR/tar" "Bianzhong-${CLEAN_VERSION}"
