@@ -1,0 +1,25 @@
+# Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)
+terminal: auto                # auto | ghostty | iterm | warp | terminal
+max_concurrent_runs: 2
+max_causal_depth: 1
+
+# 全局预算、熔断与自动清理治理
+governance:
+  daily_max_cost_usd: 3.0
+  daily_max_runs: 30
+  circuit_breaker_failures: 3
+  retention_days: 7
+
+# L1 语义分诊器（当 chime 启用 triage 时生效）
+triage:
+  provider: apple_fm          # apple_fm | agent_cli | decision_api | none
+  decision_api_url: null      # 例如 https://your-jev.example.com/v1/triage
+  decision_api_key_env: BIANZHONG_DECISION_API_KEY
+  decision_api_timeout_seconds: 4.0
+  agent_cli_driver: omp       # omp | codex
+  agent_cli_model: smol       # 如 smol / flash / gpt-5-mini
+
+workspaces:
+  - name: bianzhong
+    path: ~/data/code/github/bianzhong
+    summary: "Bianzhong macOS event-driven agent runtime"

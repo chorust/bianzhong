@@ -1,0 +1,148 @@
+name: Release macOS Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version / tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+      publish_release:
+        description: "Publish GitHub Release (creates tag if needed)"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG_NAME="${{ inputs.version }}"
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          CLEAN_VERSION="${TAG_NAME#v}"
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+          echo "CLEAN_VERSION=$CLEAN_VERSION" >> "$GITHUB_ENV"
+
+      - name: Import Apple signing certificates (optional)
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          MACOS_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+        run: |
+          if [[ -z "$MACOS_CERT_P12_BASE64" ]]; then
+            echo "No Developer ID certificate secret configured; using ad-hoc codesign (-)."
+            exit 0
+          fi
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/bianzhong-signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          CERT_P12="$RUNNER_TEMP/cert.p12"
+
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_P12"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_P12" -P "${MACOS_CERT_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          echo "TEMP_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          if [[ -n "$MACOS_CODESIGN_IDENTITY" ]]; then
+            echo "CODESIGN_IDENTITY=$MACOS_CODESIGN_IDENTITY" >> "$GITHUB_ENV"
+          fi
+          if [[ -n "$MACOS_INSTALLER_IDENTITY" ]]; then
+            echo "INSTALLER_SIGN_IDENTITY=$MACOS_INSTALLER_IDENTITY" >> "$GITHUB_ENV"
+          fi
+          rm -f "$CERT_P12"
+
+      - name: Run tests
+        run: |
+          chmod +x scripts/*.sh
+          bash scripts/test.sh
+
+      - name: Build .pkg, .dmg, and .tar.gz installers
+        run: |
+          bash scripts/package-release.sh "$CLEAN_VERSION"
+
+      - name: Notarize and staple installers (optional)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          if [[ -z "$APPLE_ID" || -z "$APPLE_TEAM_ID" || -z "$APPLE_APP_SPECIFIC_PASSWORD" ]]; then
+            echo "Apple Notarization secrets not configured; skipping notarization."
+            exit 0
+          fi
+          for file in dist/release/*.dmg dist/release/*.pkg; do
+            xcrun notarytool submit "$file" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --wait
+            xcrun stapler staple "$file"
+          done
+          (
+            cd dist/release
+            shasum -a 256 *.pkg *.dmg *.tar.gz > SHA256SUMS.txt
+          )
+
+      - name: Clean up temporary keychain
+        if: always()
+        run: |
+          if [[ -n "${TEMP_KEYCHAIN_PATH:-}" && -f "$TEMP_KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$TEMP_KEYCHAIN_PATH" || true
+          fi
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bianzhong-${{ env.CLEAN_VERSION }}-macos26
+          path: dist/release/*
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          printf '%s\n' \
+            "## Bianzhong ${TAG_NAME} (macOS 26 arm64)" \
+            "" \
+            "- **Installer (\`.pkg\`)**: 安装 \`Bianzhong.app\` 与 \`BianzhongFeishuSensor.app\` 到 \`/Applications/\`，并将 \`bz\` CLI 安装到 \`/usr/local/bin/bz\`。" \
+            "- **Disk Image (\`.dmg\`)**: 拖拽安装盘（内含 \`templates/\` 与 \`INSTALL.txt\`）。" \
+            "- **Portable Archive (\`.tar.gz\`)**: 免安装便携压缩包。" \
+            "" \
+            "> 若仓库尚未配置 Apple Developer ID 公证秘钥，下载后首次运行可执行：" \
+            "> \`xattr -cr /Applications/Bianzhong.app /Applications/BianzhongFeishuSensor.app\`" \
+            "> 如使用飞书通知感知，请仅将 **Full Disk Access** 授予 \`/Applications/BianzhongFeishuSensor.app\`。" \
+            > "$NOTES_FILE"
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/release/* --clobber
+          else
+            gh release create "$TAG_NAME" dist/release/* \
+              --target "$GITHUB_SHA" \
+              --title "Bianzhong ${TAG_NAME}" \
+              --notes-file "$NOTES_FILE" \
+              --generate-notes
+          fi

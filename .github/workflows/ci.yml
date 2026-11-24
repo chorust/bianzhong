@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Print environment toolchain
+        run: |
+          sw_vers
+          swift --version
+          xcode-select -p
+
+      - name: Build & run unit/integration tests
+        run: |
+          chmod +x scripts/*.sh
+          swift build
+          bash scripts/test.sh
+
+      - name: Package CI installer artifacts
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          bash scripts/package-release.sh "0.1.0-${SHORT_SHA}"
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bianzhong-ci-installers
+          path: dist/release/*
+          retention-days: 7
+          if-no-files-found: error
