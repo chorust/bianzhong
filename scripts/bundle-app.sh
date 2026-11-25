@@ -9,7 +9,7 @@ if [[ "${1:-}" == "--debug" ]]; then
   CONFIG="debug"
 fi
 
-CLEAN_VERSION="${VERSION:-0.2.0}"
+CLEAN_VERSION="${VERSION:-0.3.0}"
 CLEAN_VERSION="${CLEAN_VERSION#v}"
 
 echo "Building Bianzhong ($CONFIG, version $CLEAN_VERSION)..."

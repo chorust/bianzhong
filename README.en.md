@@ -21,15 +21,15 @@ The project ships as a single application bundle: `Bianzhong.app` embeds the men
   <a href="docs/research/03-agent-dispatch-and-lifecycle.md">Agent dispatch & lifecycle</a> · <a href="docs/research/04-trigger-funnel-permissions-and-hitl.md">Funnel & approval model</a>
 </p>
 
-The latest published release is **v0.2.0** (macOS 26 Apple Silicon single-app preview). The install examples below reference the **v0.2.0** release artifacts on GitHub.
+The latest published release is **v0.3.0** (macOS 26 Apple Silicon single-app preview). The install examples below reference the **v0.3.0** release artifacts on GitHub.
 
 [Features](#features) · [Screenshots](#screenshots) · [Install](#install) · [Usage](#usage) · [Project and licensing](#project-and-licensing) · [Dev](#dev)
 
 ## Features
 
-- Single-app setup: `Bianzhong.app` bundles both the `bz` CLI and Feishu Notification Center watcher, symlinking `bz` into `~/.local/bin/bz` (and `/opt/homebrew/bin/bz` when writable) on launch, with a menu bar Integrations menu to toggle `~/.zshrc` hooks.
-- Multi-source local perception: reads `com.electron.lark` notification records read-only from `usernoted`, receives failed slow commands via `bz shell-hook zsh`, and ingests custom scripts or webhooks through `bz emit` and `ingest.sock`.
-- Deterministic L0 funnel: drops `restricted` privacy events before any database write, blocks feedback loops across four layers (causal depth, self-source exclusion, active write leases, and echo hashes), and filters noise via wildcard/keyword rules, TTL dedup, trailing debounce coalescing, and cooldown locks without touching an LLM.
+- Single-app setup: `Bianzhong.app` bundles both the `bz` CLI and Feishu Notification Center watcher, symlinking `bz` into `~/.local/bin/bz` (and `/opt/homebrew/bin/bz` when writable) on launch, with dedicated Rules and Settings tabs in the menu bar for rule toggles, live dry-run testing, and `~/.zshrc` hooks.
+- Multi-source local perception: reads `com.electron.lark` notification records read-only from `usernoted` (with guided Full Disk Access onboarding), receives failed slow commands via `bz shell-hook zsh`, and ingests custom scripts or webhooks through `bz emit` and `ingest.sock`.
+- Deterministic L0 funnel & watchdogs: drops `restricted` privacy events before any database write, blocks feedback loops across four layers, and supports per-field AND matching (`title` / `subtitle` / `body` / `cwd`), cumulative window hit thresholds (`min_count` + `window: daily`), missed-signal watchdogs (`expect`), TTL dedup, trailing debounce coalescing, and cooldown locks without touching an LLM.
 - Pluggable L1 triage: supports on-device macOS 26 `FoundationModels` (`apple_fm`), a lightweight model via `omp` or `codex` (`agent_cli`), an external HTTP `decision_api` gateway, or rule pass-through (`none`).
 - Two-phase agent execution: spawns `omp` or `codex` on demand in an isolated process group (`posix_spawn`) with zero idle daemon footprint; Phase 1 runs read-only investigation and drafting, while Phase 2 enters `workspace-write` or an isolated Git worktree only after human approval.
 - Menu bar inbox and interactive notifications: `Bianzhong.app` and `UNUserNotificationCenter` actions support background approval, approval comments, copying a reply and activating Feishu, or resuming the exact session in Ghostty, iTerm2, Warp, or Terminal (`omp -r` / `codex resume`); signals arriving during Focus or screen lock can defer into a single wake digest.
@@ -65,15 +65,15 @@ Download the latest `.dmg` from [Releases](https://github.com/chorust/bianzhong/
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/Bianzhong-0.2.0-macos26-arm64.tar.gz
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/Bianzhong-0.3.0-macos26-arm64.tar.gz
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-tar -xzf Bianzhong-0.2.0-macos26-arm64.tar.gz
-cp -R "Bianzhong-0.2.0/Bianzhong.app" /Applications/
+tar -xzf Bianzhong-0.3.0-macos26-arm64.tar.gz
+cp -R "Bianzhong-0.3.0/Bianzhong.app" /Applications/
 open /Applications/Bianzhong.app
 ```
 
-If `bz` is not yet in your `PATH`, add `~/.local/bin` or click `集成 -> 写入 Zsh 慢命令钩子 (~/.zshrc)` in the menu bar.
+If `bz` is not yet in your `PATH`, add `~/.local/bin` or enable the Zsh hook in the menu bar `设置` (Settings) tab.
 
 ### .pkg installer
 
@@ -82,10 +82,10 @@ You can also install `Bianzhong.app` into `/Applications/` and `/usr/local/bin/b
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/Bianzhong-0.2.0-macos26-arm64.pkg
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/Bianzhong-0.3.0-macos26-arm64.pkg
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-sudo installer -pkg Bianzhong-0.2.0-macos26-arm64.pkg -target /
+sudo installer -pkg Bianzhong-0.3.0-macos26-arm64.pkg -target /
 ```
 
 Prebuilt bundles are ad-hoc signed without Apple notarization. After verifying checksums, clear quarantine attributes if Gatekeeper prompts on first launch:
@@ -153,7 +153,7 @@ Run `bz config` (or click `+ 配规则` in the menu bar) to open `omp` or `codex
 
 - **Slow shell command failure diagnosis**
 
-  Enable the Zsh hook from the menu bar Integrations menu (or run `bz install-cli --zsh`) to report commands that run for at least 15 seconds and exit non-zero (excluding `Ctrl+C` exit code `130`):
+  Enable the Zsh hook from the menu bar `设置` (Settings) tab (or run `bz install-cli --zsh`) to report commands that run for at least 15 seconds and exit non-zero (excluding `Ctrl+C` exit code `130`):
 
   ```bash
   source ~/.zshrc
@@ -216,7 +216,7 @@ Build all targets, run the test suite, and package single-app installers locally
 ```bash
 swift build
 bash scripts/test.sh
-bash scripts/package-release.sh 0.2.0
+bash scripts/package-release.sh 0.3.0
 ```
 
 Tests run offline in isolated temporary directories without network calls or live LLM requests. GitHub Actions runs [CI](.github/workflows/ci.yml) on pushes/PRs and [Release](.github/workflows/release.yml) on `v*` tags using `macos-26` runners. Live `usernoted` database reads, interactive system notification callbacks, terminal handoff launches, and live model triage must be verified locally on macOS 26.

@@ -21,15 +21,15 @@ Bianzhong（编钟）连接本机事件源与你自备的 CLI Agent（如 `omp`�
   <a href="docs/research/03-agent-dispatch-and-lifecycle.md">Agent 调度机制</a> · <a href="docs/research/04-trigger-funnel-permissions-and-hitl.md">触发漏斗与审批</a>
 </p>
 
-最新已发布版本为 **v0.2.0**（macOS 26 Apple Silicon 单应用预览版）；下方安装示例对应 GitHub Release 上的 **v0.2.0** 产物。
+最新已发布版本为 **v0.3.0**（macOS 26 Apple Silicon 单应用预览版）；下方安装示例对应 GitHub Release 上的 **v0.3.0** 产物。
 
 [Features](#features) · [Screenshots](#screenshots) · [Install](#install) · [Usage](#usage) · [项目与许可](#项目与许可) · [Dev](#dev)
 
 ## Features
 
-- 单应用开箱即用：`Bianzhong.app` 内置 `bz` 命令行与飞书通知监听，启动时自动把 `bz` 软链到 `~/.local/bin/bz`（如 `/opt/homebrew/bin` 可写也会一并创建），并在菜单栏「集成」中一键管理 `~/.zshrc` 钩子。
-- 多源本地信号接入：内置传感器只读查询 `usernoted` 中的 `com.electron.lark` 飞书通知；Zsh 慢命令钩子自动上报耗时失败命令；外部脚本经 `bz emit` 或 Unix Domain Socket `ingest.sock` 推送事件。
-- L0 确定性漏斗：`restricted` 隐私事件落库前直接丢弃；通过因果深度、自源排除、写路径租约与回声指纹阻断循环触发，再经通配符与关键词匹配、TTL 去重、尾随防抖合并及冷却锁过滤噪声，这一层不调用大模型。
+- 单应用开箱即用：`Bianzhong.app` 内置 `bz` 命令行与飞书通知监听，启动时自动把 `bz` 软链到 `~/.local/bin/bz`（如 `/opt/homebrew/bin` 可写也会一并创建），并在菜单栏「规则 / 设置」标签页中可视化管理规则启停、在线测试与 `~/.zshrc` 钩子。
+- 多源本地信号接入：内置传感器只读查询 `usernoted` 中的 `com.electron.lark` 飞书通知（缺权限时自动引导开启完全磁盘访问权限）；Zsh 慢命令钩子自动上报耗时失败命令；外部脚本经 `bz emit` 或 Unix Domain Socket `ingest.sock` 推送事件。
+- L0 确定性漏斗与窗口看门狗：`restricted` 隐私事件落库前直接丢弃；通过因果深度、自源排除、写路径租约与回声指纹阻断循环触发；支持按 `title` / `subtitle` / `body` / `cwd` 分字段匹配与 AND 组合、时间窗口累计次数阈值（如 `min_count: 2` + `window: daily`）、预期窗口未收到信号告警（`expect`）、TTL 去重、尾随防抖合并及冷却锁，这一层不调用大模型。
 - 可选 L1 语义分诊：支持 macOS 26 本地 `FoundationModels`（`apple_fm`）、指定轻量模型的 `omp` / `codex`（`agent_cli`）、外部 HTTP 接口（`decision_api`）以及直通放行（`none`）。
 - 两阶段 Agent 调度：按需通过 `posix_spawn` 在独立进程组拉起 `omp` 或 `codex`，空闲时无常驻进程；Phase 1 限制只读工具集或 `read-only` 沙箱完成勘察与拟稿，批准后再进入可写模式的 Phase 2，并可为修复任务创建独立 Git Worktree。
 - 菜单栏与交互通知审批：通过 `Bianzhong.app` 听音台与 `UNUserNotificationCenter` 通知按钮完成后台批准、附言执行、复制回复并唤起飞书，或在 Ghostty、iTerm2、Warp、Terminal 中直接接管原会话（`omp -r` / `codex resume`）；专注或锁屏期间的信号可暂存，解锁后合并为单条摘要。
@@ -65,15 +65,15 @@ Bianzhong（编钟）连接本机事件源与你自备的 CLI Agent（如 `omp`�
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/Bianzhong-0.2.0-macos26-arm64.tar.gz
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/Bianzhong-0.3.0-macos26-arm64.tar.gz
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-tar -xzf Bianzhong-0.2.0-macos26-arm64.tar.gz
-cp -R "Bianzhong-0.2.0/Bianzhong.app" /Applications/
+tar -xzf Bianzhong-0.3.0-macos26-arm64.tar.gz
+cp -R "Bianzhong-0.3.0/Bianzhong.app" /Applications/
 open /Applications/Bianzhong.app
 ```
 
-如果新终端里找不到 `bz`，确认 `~/.local/bin` 已在 `PATH` 中，或在菜单栏点击「集成 -> 写入 Zsh 慢命令钩子 (~/.zshrc)」（会一并写入 `export PATH="$HOME/.local/bin:$PATH"`）。
+如果新终端里找不到 `bz`，确认 `~/.local/bin` 已在 `PATH` 中，或在菜单栏「设置」页开启「Zsh 慢命令钩子」（会一并写入 `export PATH="$HOME/.local/bin:$PATH"`）。
 
 ### .pkg 安装包
 
@@ -82,10 +82,10 @@ open /Applications/Bianzhong.app
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/Bianzhong-0.2.0-macos26-arm64.pkg
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/Bianzhong-0.3.0-macos26-arm64.pkg
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-sudo installer -pkg Bianzhong-0.2.0-macos26-arm64.pkg -target /
+sudo installer -pkg Bianzhong-0.3.0-macos26-arm64.pkg -target /
 ```
 
 未配置 Apple Developer ID 公证时，首次打开预编译包若遇到 Gatekeeper 提示，确认校验和无误后执行：
@@ -153,7 +153,7 @@ workspaces:
 
 - **终端慢命令失败诊断**
 
-  在菜单栏点击「集成 -> 写入 Zsh 慢命令钩子 (~/.zshrc)」（或运行 `bz install-cli --zsh`），终端里耗时达到 15 秒且非 `Ctrl+C` 中断（`exit_code != 130`）的失败命令会在后台静默上报目录与退出码：
+  在菜单栏「设置」页开启「Zsh 慢命令钩子」（或运行 `bz install-cli --zsh`），终端里耗时达到 15 秒且非 `Ctrl+C` 中断（`exit_code != 130`）的失败命令会在后台静默上报目录与退出码：
 
   ```bash
   source ~/.zshrc
@@ -214,7 +214,7 @@ Bianzhong 把运行时本身保持精薄，将工具调用循环、上下文压�
 ```bash
 swift build
 bash scripts/test.sh
-bash scripts/package-release.sh 0.2.0
+bash scripts/package-release.sh 0.3.0
 ```
 
 默认测试套件在临时目录离线运行，不访问公网也不调用线上大模型。GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 和 [Release 发布工作流](.github/workflows/release.yml) 均运行在 `macos-26` Runner 上，分别用于每次推送验证和 `v*` 标签自动发布安装包。真实通知中心数据库读取、系统通知操作回调与在线模型分诊需要在本地 macOS 26 环境单独验收。

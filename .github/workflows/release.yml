@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version / tag (e.g. v0.2.0)"
+        description: "Release version / tag (e.g. v0.3.0)"
         required: true
-        default: "v0.2.0"
+        default: "v0.3.0"
       publish_release:
         description: "Publish GitHub Release (creates tag if needed)"
         type: boolean
@@ -134,7 +134,7 @@ jobs:
             "" \
             "> 若仓库尚未配置 Apple Developer ID 公证秘钥，下载后首次运行可执行：" \
             "> \`xattr -cr /Applications/Bianzhong.app\`" \
-            "> 如需启用内置飞书通知监听，请将 **Full Disk Access** 授予 \`/Applications/Bianzhong.app\`（不需要时可在菜单栏「集成」中关闭）。" \
+            "> 如需启用内置飞书通知监听，请将 **Full Disk Access** 授予 \`/Applications/Bianzhong.app\`（不需要时可在菜单栏「设置」中关闭）。" \
             > "$NOTES_FILE"
 
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
