@@ -42,6 +42,7 @@ public struct BusStatusSummary: Codable, Sendable {
     public let pendingApprovalsCount: Int
     public let runsCount: Int
     public let paused: Bool
+    public let feishuSensor: String?
 
     enum CodingKeys: String, CodingKey {
         case daemonPID = "daemon_pid"
@@ -50,6 +51,25 @@ public struct BusStatusSummary: Codable, Sendable {
         case pendingApprovalsCount = "pending_approvals_count"
         case runsCount = "runs_count"
         case paused
+        case feishuSensor = "feishu_sensor"
+    }
+
+    public init(
+        daemonPID: Int32,
+        loadedRules: Int,
+        eventsCount: Int,
+        pendingApprovalsCount: Int,
+        runsCount: Int,
+        paused: Bool,
+        feishuSensor: String? = nil
+    ) {
+        self.daemonPID = daemonPID
+        self.loadedRules = loadedRules
+        self.eventsCount = eventsCount
+        self.pendingApprovalsCount = pendingApprovalsCount
+        self.runsCount = runsCount
+        self.paused = paused
+        self.feishuSensor = feishuSensor
     }
 }
 

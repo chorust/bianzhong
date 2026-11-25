@@ -11,6 +11,9 @@ final class AppModel: ObservableObject {
     @Published var paused = false
     @Published var loadedRulesCount = 0
     @Published var deferredCount = 0
+    @Published var feishuEnabled = true
+    @Published var feishuStatus: FeishuSensorStatus = .disabled
+    @Published var cliStatus: CLIIntegrationStatus = CLIIntegration.currentStatus()
 
     let orchestrator: Orchestrator
     let notificationManager: NotificationManager
@@ -19,6 +22,7 @@ final class AppModel: ObservableObject {
     init() {
         let paths = BianzhongPaths()
         _ = try? DefaultTemplates.installDefaultsIfMissing(paths: paths)
+        CLIIntegration.autoInstallOnLaunchIfEligible()
 
         var capturedSelf: AppModel?
         let callbacks = OrchestratorCallbacks(
@@ -42,7 +46,7 @@ final class AppModel: ObservableObject {
         self.notificationManager = NotificationManager(orchestrator: self.orchestrator)
         capturedSelf = self
 
-        try? orchestrator.start()
+        try? orchestrator.start(enableBuiltInSensors: true)
         notificationManager.setupIfSupported()
         registerWakeObservers()
         refresh()
@@ -79,6 +83,38 @@ final class AppModel: ObservableObject {
         paused = orchestrator.isPaused()
         loadedRulesCount = orchestrator.funnel.currentRules().count
         deferredCount = orchestrator.deferredDigestCount()
+        feishuEnabled = orchestrator.currentConfig().feishuSensorEnabled
+        feishuStatus = orchestrator.feishuSensorStatus()
+        cliStatus = CLIIntegration.currentStatus()
+    }
+
+    func reinstallCLISymlink() {
+        guard let bz = CLIIntegration.resolveBundledBZPath() else { return }
+        CLIIntegration.ensureCLISymlinks(sourceBZPath: bz, force: true)
+        refresh()
+    }
+
+    func toggleZshHook() {
+        let next = !cliStatus.isZshHookInstalled
+        if next, let bz = CLIIntegration.resolveBundledBZPath() {
+            CLIIntegration.ensureCLISymlinks(sourceBZPath: bz, force: false)
+        }
+        _ = try? CLIIntegration.setZshHook(enabled: next)
+        refresh()
+    }
+
+    func toggleFeishuSensor() {
+        orchestrator.setFeishuSensorEnabled(!feishuEnabled)
+        refresh()
+    }
+
+    func openFullDiskAccessSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
+        if Bundle.main.bundleURL.pathExtension == "app" {
+            NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+        }
     }
 
     func openConfigChat() {
@@ -124,7 +160,7 @@ struct InboxView: View {
                 Text("编钟 · Bianzhong")
                     .font(.headline)
                 Spacer()
-                Text("\(model.loadedRulesCount) 规则")
+                Text(model.feishuStatus == .watching ? "飞书已连 · \(model.loadedRulesCount) 规则" : "\(model.loadedRulesCount) 规则")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button(model.paused ? "恢复监听" : "暂停 1h") {
@@ -136,6 +172,31 @@ struct InboxView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+            }
+
+            if model.feishuStatus == .needsFullDiskAccess {
+                HStack(spacing: 6) {
+                    Text("飞书通知需授予完全磁盘访问权限")
+                        .font(.caption2)
+                        .lineLimit(1)
+                    Spacer()
+                    Button("去开启 ↗") {
+                        model.openFullDiskAccessSettings()
+                    }
+                    .controlSize(.mini)
+                    Button("重试") {
+                        model.orchestrator.retryFeishuSensor()
+                    }
+                    .controlSize(.mini)
+                    Button("关闭") {
+                        model.orchestrator.setFeishuSensorEnabled(false)
+                    }
+                    .controlSize(.mini)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.14))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
             }
 
             Divider()
@@ -187,6 +248,25 @@ struct InboxView: View {
                 }
                 .controlSize(.small)
 
+                Menu("集成") {
+                    Button(model.cliStatus.isCLIInstalled ? "✓ bz 命令已安装（点击修复）" : "安装 bz 命令行工具") {
+                        model.reinstallCLISymlink()
+                    }
+                    Button(model.cliStatus.isZshHookInstalled ? "✓ Zsh 慢命令钩子已启用" : "写入 Zsh 慢命令钩子 (~/.zshrc)") {
+                        model.toggleZshHook()
+                    }
+                    Divider()
+                    Button(model.feishuEnabled ? "关闭飞书通知监听" : "开启飞书通知监听") {
+                        model.toggleFeishuSensor()
+                    }
+                    if model.feishuStatus == .needsFullDiskAccess {
+                        Button("打开完全磁盘访问权限设置 ↗") {
+                            model.openFullDiskAccessSettings()
+                        }
+                    }
+                }
+                .controlSize(.small)
+
                 Spacer()
 
                 Button("退出") {
@@ -197,7 +277,7 @@ struct InboxView: View {
             }
         }
         .padding(12)
-        .frame(width: 400)
+        .frame(width: 430)
     }
 }
 

@@ -20,6 +20,8 @@ private func printUsage() {
       bz digest
       bz gc
       bz reset-circuit <chime-id>
+      bz install-cli [--zsh]
+      bz uninstall-cli
       bz shell-hook zsh
       bz reload
     """)
@@ -220,6 +222,26 @@ Task {
             let resp = try SocketClient.send(request: BusRequest(action: "reset_circuit", chimeID: args[1]), socketURL: paths.socketURL)
             print(resp.message)
 
+        case "install-cli":
+            guard let sourceBZ = CLIIntegration.resolveBundledBZPath() else {
+                fputs("Unable to locate bz binary to symlink.\n", stderr)
+                exit(1)
+            }
+            let linked = CLIIntegration.ensureCLISymlinks(sourceBZPath: sourceBZ, force: args.contains("--force"))
+            print(linked.isEmpty ? "No writable bin directories found." : "Linked bz -> \(linked.joined(separator: ", "))")
+            if args.contains("--zsh") {
+                try CLIIntegration.setZshHook(enabled: true)
+                print("Enabled Zsh slow-command hook in ~/.zshrc (run: source ~/.zshrc)")
+            }
+
+        case "uninstall-cli":
+            let removed = CLIIntegration.removeCLISymlinks(force: args.contains("--force"))
+            if args.contains("--zsh") || CLIIntegration.isZshHookInstalled() {
+                try CLIIntegration.setZshHook(enabled: false)
+                print("Removed Zsh hook block from ~/.zshrc")
+            }
+            print(removed.isEmpty ? "No managed bz symlinks found." : "Removed: \(removed.joined(separator: ", "))")
+
         case "shell-hook":
             let shell = args.dropFirst().first ?? "zsh"
             if shell != "zsh" {
@@ -232,7 +254,8 @@ Task {
         case "status", "inbox":
             if let resp = try? SocketClient.send(request: BusRequest(action: "status"), socketURL: paths.socketURL) {
                 if let s = resp.status {
-                    print("Bianzhong daemon pid=\(s.daemonPID) rules=\(s.loadedRules) events=\(s.eventsCount) pending=\(s.pendingApprovalsCount) runs=\(s.runsCount) paused=\(s.paused)")
+                    let feishu = s.feishuSensor ?? "disabled"
+                    print("Bianzhong daemon pid=\(s.daemonPID) rules=\(s.loadedRules) feishu=\(feishu) events=\(s.eventsCount) pending=\(s.pendingApprovalsCount) runs=\(s.runsCount) paused=\(s.paused)")
                 }
                 let items = resp.approvals ?? []
                 if items.isEmpty {

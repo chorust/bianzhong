@@ -91,6 +91,10 @@ public final class Orchestrator: @unchecked Sendable {
 
     private var config: AppConfig
     private var bus: SocketBus?
+    private var feishuMonitor: FeishuSensorMonitor?
+    private var builtInSensorsEnabled = false
+    private var customFeishuDBURL: URL?
+    private var feishuSkipExistingOnFirstRun = true
     private let stateLock = NSLock()
     private var pausedUntil: Date?
     private var pauseTimer: DispatchSourceTimer?
@@ -114,13 +118,29 @@ public final class Orchestrator: @unchecked Sendable {
         self.runGate = ConcurrencyGate(limit: config.maxConcurrentRuns)
     }
 
-    public func start() throws {
+    public func start(
+        enableBuiltInSensors: Bool = false,
+        feishuDBURL: URL? = nil,
+        skipExistingFeishuOnFirstRun: Bool = true
+    ) throws {
         let server = SocketBus(socketURL: paths.socketURL) { [weak self] req in
             guard let self else { return BusResponse(ok: false, message: "Orchestrator deallocated") }
             return self.handleBusRequest(req)
         }
         try server.start()
+
+        stateLock.lock()
         self.bus = server
+        self.builtInSensorsEnabled = enableBuiltInSensors
+        if let feishuDBURL {
+            self.customFeishuDBURL = feishuDBURL
+        }
+        self.feishuSkipExistingOnFirstRun = skipExistingFeishuOnFirstRun
+        stateLock.unlock()
+
+        if enableBuiltInSensors {
+            syncFeishuMonitor()
+        }
 
         let retention = currentConfig().retentionDays
         Task.detached(priority: .background) { [weak self] in
@@ -133,10 +153,73 @@ public final class Orchestrator: @unchecked Sendable {
         stateLock.lock()
         let timer = pauseTimer
         pauseTimer = nil
+        let monitor = feishuMonitor
+        feishuMonitor = nil
+        builtInSensorsEnabled = false
         stateLock.unlock()
         timer?.cancel()
+        monitor?.stop()
         bus?.stop()
         bus = nil
+    }
+
+    public func feishuSensorStatus() -> FeishuSensorStatus {
+        let monitor = stateLock.withLock { feishuMonitor }
+        return monitor?.currentStatus() ?? .disabled
+    }
+
+    public func retryFeishuSensor() {
+        let monitor = stateLock.withLock { feishuMonitor }
+        monitor?.retryNow()
+    }
+
+    public func setFeishuSensorEnabled(_ enabled: Bool) {
+        try? AppConfig.setFeishuSensorEnabled(enabled, in: paths.configFile)
+        reloadConfig()
+    }
+
+    private func syncFeishuMonitor() {
+        let (sensorsActive, enabled, dbURL, skipExisting, currentMonitor): (Bool, Bool, URL, Bool, FeishuSensorMonitor?) = stateLock.withLock {
+            (
+                builtInSensorsEnabled,
+                config.feishuSensorEnabled,
+                customFeishuDBURL ?? FeishuSensorMonitor.defaultUsernotedDBURL(),
+                feishuSkipExistingOnFirstRun,
+                feishuMonitor
+            )
+        }
+
+        guard sensorsActive else { return }
+
+        if !enabled {
+            if let currentMonitor {
+                stateLock.withLock { feishuMonitor = nil }
+                currentMonitor.stop()
+            }
+            return
+        }
+
+        if let currentMonitor, currentMonitor.dbURL == dbURL {
+            return
+        }
+
+        currentMonitor?.stop()
+        let newMonitor = FeishuSensorMonitor(
+            dbURL: dbURL,
+            cursorURL: paths.feishuCursorURL,
+            skipExistingOnFirstRun: skipExisting,
+            eventSink: { [weak self] event in
+                guard let self else { return false }
+                return self.handleBusRequest(BusRequest(action: "emit", event: event)).ok
+            },
+            onStatusChange: { [weak self] _ in
+                self?.callbacks.onApprovalUpdated()
+            }
+        )
+        stateLock.withLock {
+            feishuMonitor = newMonitor
+        }
+        newMonitor.start()
     }
 
     public func currentConfig() -> AppConfig {
@@ -247,6 +330,7 @@ public final class Orchestrator: @unchecked Sendable {
         Task {
             await gate.updateLimit(newMaxRuns)
         }
+        syncFeishuMonitor()
         callbacks.onApprovalUpdated()
     }
 
@@ -292,7 +376,8 @@ public final class Orchestrator: @unchecked Sendable {
                 eventsCount: counts.events,
                 pendingApprovalsCount: counts.pendingApprovals,
                 runsCount: counts.runs,
-                paused: isPaused()
+                paused: isPaused(),
+                feishuSensor: feishuSensorStatus().rawValue
             )
             return BusResponse(
                 ok: true,

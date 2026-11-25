@@ -4,11 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-RAW_VERSION="${1:-${VERSION:-0.1.0}}"
+RAW_VERSION="${1:-${VERSION:-0.2.0}}"
 CLEAN_VERSION="${RAW_VERSION#v}"
 PKG_VERSION="$(echo "$CLEAN_VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*$/\1/')"
 if [[ ! "$PKG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  PKG_VERSION="0.1.0"
+  PKG_VERSION="0.2.0"
 fi
 
 ARCH="${BIANZHONG_ARCH:-arm64}"
@@ -23,13 +23,11 @@ mkdir -p "$RELEASE_DIR"
 STAGE_DIR="$(mktemp -d /tmp/bz-release-XXXXXX)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
-# 1. Build macOS Installer (.pkg) installing apps into /Applications and CLI into /usr/local/bin/bz
+# 1. Build macOS Installer (.pkg) installing Bianzhong.app into /Applications and symlink /usr/local/bin/bz
 PKGROOT="$STAGE_DIR/pkgroot"
 mkdir -p "$PKGROOT/Applications" "$PKGROOT/usr/local/bin"
 ditto "$ROOT_DIR/dist/Bianzhong.app" "$PKGROOT/Applications/Bianzhong.app"
-ditto "$ROOT_DIR/dist/BianzhongFeishuSensor.app" "$PKGROOT/Applications/BianzhongFeishuSensor.app"
-cp "$ROOT_DIR/dist/bz" "$PKGROOT/usr/local/bin/bz"
-chmod 755 "$PKGROOT/usr/local/bin/bz"
+ln -sf "/Applications/Bianzhong.app/Contents/MacOS/bz" "$PKGROOT/usr/local/bin/bz"
 
 COMPONENTS_PLIST="$STAGE_DIR/components.plist"
 pkgbuild --analyze --root "$PKGROOT" "$COMPONENTS_PLIST"
@@ -55,13 +53,10 @@ if [[ -n "${INSTALLER_SIGN_IDENTITY:-}" ]]; then
 fi
 pkgbuild "${PKG_ARGS[@]}" "$PKG_PATH"
 
-# 2. Build drag-and-drop macOS Disk Image (.dmg)
+# 2. Build single-app drag-and-drop macOS Disk Image (.dmg)
 DMGROOT="$STAGE_DIR/dmg"
-mkdir -p "$DMGROOT/bin"
+mkdir -p "$DMGROOT"
 ditto "$ROOT_DIR/dist/Bianzhong.app" "$DMGROOT/Bianzhong.app"
-ditto "$ROOT_DIR/dist/BianzhongFeishuSensor.app" "$DMGROOT/BianzhongFeishuSensor.app"
-cp "$ROOT_DIR/dist/bz" "$DMGROOT/bin/bz"
-chmod 755 "$DMGROOT/bin/bz"
 cp -R "$ROOT_DIR/templates" "$DMGROOT/templates"
 ln -s /Applications "$DMGROOT/Applications"
 
@@ -69,19 +64,19 @@ cat > "$DMGROOT/INSTALL.txt" <<'EOF'
 Bianzhong（编钟）for macOS 26 (arm64)
 ======================================
 
-推荐方式（或直接运行 .pkg 安装包）：
-1. 将 Bianzhong.app 与 BianzhongFeishuSensor.app 拖入 Applications 文件夹。
-2. 安装 CLI 工具：
-   sudo install -m 755 bin/bz /usr/local/bin/bz
-3. 初始化默认规则并启动配置助手：
-   bz init
-   bz config
+单应用安装步骤（或直接运行 .pkg 安装包）：
+1. 将 Bianzhong.app 拖入 Applications 文件夹并打开。
+2. 首次启动会自动：
+   - 初始化 ~/.config/bianzhong/ 默认配置与示例规则
+   - 自动将 bz 命令软链到 ~/.local/bin/bz（若 /opt/homebrew/bin 可写也会一并创建）
+3. 如需接入终端慢命令钩子：点击菜单栏「集成 -> 写入 Zsh 慢命令钩子 (~/.zshrc)」，或运行：
+   bz install-cli --zsh
 
-重要说明（未配 Apple Developer ID 公证时）：
+权限与 Gatekeeper 说明（未配 Apple Developer ID 公证时）：
 - 若首次打开提示“无法验证开发者/已损坏”，执行：
-  xattr -cr /Applications/Bianzhong.app /Applications/BianzhongFeishuSensor.app
-- Full Disk Access 仅需授予 /Applications/BianzhongFeishuSensor.app
-  （主程序 Bianzhong.app 与下游 Agent 保持 Zero-TCC）。
+  xattr -cr /Applications/Bianzhong.app
+- 如使用内置飞书通知监听，在「系统设置 -> 隐私与安全性 -> 完全磁盘访问权限」中授予 Bianzhong.app；
+  不需要该监听时可在菜单栏「集成 -> 关闭飞书通知监听」关闭（完全零额外权限）。
 EOF
 
 DMG_PATH="$RELEASE_DIR/${ARTIFACT_BASE}.dmg"
@@ -96,9 +91,6 @@ hdiutil create \
 TARROOT="$STAGE_DIR/tar/Bianzhong-${CLEAN_VERSION}"
 mkdir -p "$TARROOT"
 ditto "$ROOT_DIR/dist/Bianzhong.app" "$TARROOT/Bianzhong.app"
-ditto "$ROOT_DIR/dist/BianzhongFeishuSensor.app" "$TARROOT/BianzhongFeishuSensor.app"
-cp "$ROOT_DIR/dist/bz" "$TARROOT/bz"
-chmod 755 "$TARROOT/bz"
 cp -R "$ROOT_DIR/templates" "$TARROOT/templates"
 cp "$ROOT_DIR/README.md" "$TARROOT/README.md"
 [[ -f "$ROOT_DIR/README.en.md" ]] && cp "$ROOT_DIR/README.en.md" "$TARROOT/README.en.md"

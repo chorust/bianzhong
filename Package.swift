@@ -30,8 +30,7 @@ let package = Package(
     products: [
         .library(name: "BianzhongCore", targets: ["BianzhongCore"]),
         .executable(name: "BianzhongApp", targets: ["BianzhongApp"]),
-        .executable(name: "bz", targets: ["bz"]),
-        .executable(name: "bz-feishu-sensor", targets: ["bz-feishu-sensor"])
+        .executable(name: "bz", targets: ["bz"])
     ],
     targets: [
         .target(
@@ -56,17 +55,6 @@ let package = Package(
             dependencies: ["BianzhongCore"],
             swiftSettings: [
                 .swiftLanguageMode(.v5)
-            ]
-        ),
-        .executableTarget(
-            name: "bz-feishu-sensor",
-            dependencies: ["BianzhongCore"],
-            exclude: ["Info.plist"],
-            swiftSettings: [
-                .swiftLanguageMode(.v5)
-            ],
-            linkerSettings: [
-                .linkedLibrary("sqlite3")
             ]
         ),
         .testTarget(

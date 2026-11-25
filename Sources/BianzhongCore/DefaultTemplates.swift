@@ -5,6 +5,7 @@ public enum DefaultTemplates {
     public static let configYAML = """
     # Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)
     terminal: auto                # auto | ghostty | iterm | warp | terminal
+    feishu_sensor_enabled: true   # 需在 系统设置 -> 完全磁盘访问权限 中授予 Bianzhong.app
     max_concurrent_runs: 2
     max_causal_depth: 1
 

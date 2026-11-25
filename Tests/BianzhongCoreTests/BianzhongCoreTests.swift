@@ -1033,4 +1033,193 @@ struct BianzhongCoreTests {
         #expect(decoded?.subtitle == "Bot")
         #expect(decoded?.body == "P0 异常")
     }
+
+    @Test("19. Single-app in-process Feishu monitor, bz symlink automation, and idempotent .zshrc hook")
+    func singleAppSensorAndCLIIntegration() async throws {
+        let shortID = String(UUID().uuidString.prefix(8))
+        let dir = URL(fileURLWithPath: "/tmp/bz-t19-\(shortID)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let binDir = dir.appendingPathComponent("bin", isDirectory: true)
+        let srcDir = dir.appendingPathComponent("src", isDirectory: true)
+        let cfgDir = dir.appendingPathComponent("cfg", isDirectory: true)
+        let stateDir = dir.appendingPathComponent("state", isDirectory: true)
+        try FileManager.default.createDirectory(at: srcDir, withIntermediateDirectories: true)
+
+        // (a) Mock executable bz inside bundle + symlink lifecycle
+        let fakeBZ = srcDir.appendingPathComponent("bz")
+        try "#!/bin/zsh\necho ok\n".write(to: fakeBZ, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeBZ.path)
+
+        let linked = CLIIntegration.ensureCLISymlinks(
+            sourceBZPath: fakeBZ.path,
+            homeDir: dir,
+            candidateDirs: [binDir],
+            force: false
+        )
+        #expect(linked == [binDir.appendingPathComponent("bz").path])
+        let dest = try FileManager.default.destinationOfSymbolicLink(atPath: binDir.appendingPathComponent("bz").path)
+        #expect(URL(fileURLWithPath: dest).resolvingSymlinksInPath().path == fakeBZ.resolvingSymlinksInPath().path)
+
+        // (b) Custom non-symlink bz binary is preserved when force == false, replaced when force == true
+        let customBZ = dir.appendingPathComponent("custom-bin/bz")
+        try FileManager.default.createDirectory(at: customBZ.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "custom".write(to: customBZ, atomically: true, encoding: .utf8)
+        let skipped = CLIIntegration.ensureCLISymlinks(
+            sourceBZPath: fakeBZ.path,
+            homeDir: dir,
+            candidateDirs: [customBZ.deletingLastPathComponent()],
+            force: false
+        )
+        #expect(skipped.isEmpty)
+        let forced = CLIIntegration.ensureCLISymlinks(
+            sourceBZPath: fakeBZ.path,
+            homeDir: dir,
+            candidateDirs: [customBZ.deletingLastPathComponent()],
+            force: true
+        )
+        #expect(forced == [customBZ.path])
+
+        // (c) Idempotent .zshrc block add & clean removal preserving existing lines
+        let zshrc = dir.appendingPathComponent(".zshrc")
+        try "export FOO=bar\nalias ll='ls -la'\n".write(to: zshrc, atomically: true, encoding: .utf8)
+        try CLIIntegration.setZshHook(enabled: true, zshrcURL: zshrc)
+        try CLIIntegration.setZshHook(enabled: true, zshrcURL: zshrc)
+        #expect(CLIIntegration.isZshHookInstalled(zshrcURL: zshrc) == true)
+        let withHook = try String(contentsOf: zshrc, encoding: .utf8)
+        #expect(withHook.components(separatedBy: CLIIntegration.blockStartMarker).count == 2)
+        #expect(withHook.contains("export FOO=bar"))
+
+        try CLIIntegration.setZshHook(enabled: false, zshrcURL: zshrc)
+        #expect(CLIIntegration.isZshHookInstalled(zshrcURL: zshrc) == false)
+        let withoutHook = try String(contentsOf: zshrc, encoding: .utf8)
+        #expect(withoutHook.contains("export FOO=bar"))
+        #expect(!withoutHook.contains("bz shell-hook zsh"))
+
+        // (d) In-process Orchestrator built-in Feishu monitor ingests usernoted fixture without separate app
+        let paths = BianzhongPaths(configDir: cfgDir, stateDir: stateDir)
+        try paths.ensureDirectories()
+        let dbURL = stateDir.appendingPathComponent("usernoted-inproc.db")
+        var db: OpaquePointer?
+        #expect(sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        let ddl = """
+        CREATE TABLE app (app_id INTEGER PRIMARY KEY, identifier TEXT NOT NULL);
+        CREATE TABLE record (rec_id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL, data BLOB, delivered_date REAL);
+        INSERT INTO app (app_id, identifier) VALUES (1, 'com.electron.lark');
+        """
+        #expect(sqlite3_exec(db, ddl, nil, nil, nil) == SQLITE_OK)
+        let plist: [String: Any] = ["req": ["titl": "系统告警", "subt": "Bot", "body": "接口 500"]]
+        let blob = try PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0)
+        var stmt: OpaquePointer?
+        #expect(sqlite3_prepare_v2(db, "INSERT INTO record (rec_id, app_id, data, delivered_date) VALUES (1, 1, ?, 0);", -1, &stmt, nil) == SQLITE_OK)
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        _ = blob.withUnsafeBytes { raw in
+            sqlite3_bind_blob(stmt, 1, raw.baseAddress, Int32(raw.count), transient)
+        }
+        #expect(sqlite3_step(stmt) == SQLITE_DONE)
+        sqlite3_finalize(stmt)
+
+        let orch = try Orchestrator(paths: paths)
+        try orch.start(enableBuiltInSensors: true, feishuDBURL: dbURL, skipExistingFeishuOnFirstRun: false)
+        defer { orch.stop() }
+
+        for _ in 0..<40 {
+            if orch.feishuSensorStatus() == .watching && (try? orch.store.eventCount()) == 1 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(orch.feishuSensorStatus() == .watching)
+        #expect(try orch.store.eventCount() == 1)
+
+        orch.setFeishuSensorEnabled(false)
+        #expect(orch.feishuSensorStatus() == .disabled)
+    }
+
+    @Test("20. Monitor releases without retain cycle, third-party bz symlinks stay untouched, and top-level config update preserves comments")
+    func reviewFixesMonitorDeinitAndSymlinkSafety() async throws {
+        let shortID = String(UUID().uuidString.prefix(8))
+        let dir = URL(fileURLWithPath: "/tmp/bz-t20-\(shortID)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        // (a) FeishuSensorMonitor must deallocate cleanly without calling stop() (no FSEventStream retain cycle)
+        let dbURL = dir.appendingPathComponent("usernoted.db")
+        var db: OpaquePointer?
+        #expect(sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK)
+        let ddl = """
+        CREATE TABLE app (app_id INTEGER PRIMARY KEY, identifier TEXT NOT NULL);
+        CREATE TABLE record (rec_id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL, data BLOB, delivered_date REAL);
+        """
+        #expect(sqlite3_exec(db, ddl, nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(db)
+
+        weak var weakMonitor: FeishuSensorMonitor?
+        do {
+            let m = FeishuSensorMonitor(
+                dbURL: dbURL,
+                cursorURL: dir.appendingPathComponent("cursor.txt"),
+                skipExistingOnFirstRun: true,
+                eventSink: { _ in true }
+            )
+            weakMonitor = m
+            m.start()
+            for _ in 0..<40 {
+                if m.currentStatus() == .watching { break }
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            #expect(m.currentStatus() == .watching)
+        }
+        for _ in 0..<20 {
+            if weakMonitor == nil { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        #expect(weakMonitor == nil)
+
+        // (b) Third-party `bz` symlinks stay untouched when force == false, and transient bundle paths skip auto-link
+        let binDir = dir.appendingPathComponent("bin", isDirectory: true)
+        let appBZ = dir.appendingPathComponent("Applications/Bianzhong.app/Contents/MacOS/bz")
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: appBZ.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/zsh\nexit 0\n".write(to: appBZ, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: appBZ.path)
+
+        let linkPath = binDir.appendingPathComponent("bz").path
+        let thirdPartyTarget = "/opt/thirdparty/bin/bz"
+        #expect(Darwin.symlink(thirdPartyTarget, linkPath) == 0)
+
+        let skipped = CLIIntegration.ensureCLISymlinks(
+            sourceBZPath: appBZ.path,
+            homeDir: dir,
+            candidateDirs: [binDir],
+            force: false
+        )
+        #expect(skipped.isEmpty)
+        #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: linkPath)) == thirdPartyTarget)
+
+        let removed = CLIIntegration.removeCLISymlinks(homeDir: dir, candidateDirs: [binDir], force: false)
+        #expect(removed.isEmpty)
+        #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: linkPath)) == thirdPartyTarget)
+
+        #expect(CLIIntegration.shouldAutoInstallOnLaunch(bundleURL: URL(fileURLWithPath: "/Applications/Bianzhong.app")) == true)
+        #expect(CLIIntegration.shouldAutoInstallOnLaunch(bundleURL: URL(fileURLWithPath: "/Volumes/Bianzhong 0.2.0/Bianzhong.app")) == false)
+        #expect(CLIIntegration.shouldAutoInstallOnLaunch(bundleURL: URL(fileURLWithPath: "/private/var/folders/ab/AppTranslocation/123/d/Bianzhong.app")) == false)
+        #expect(CLIIntegration.shouldAutoInstallOnLaunch(bundleURL: URL(fileURLWithPath: "/tmp/.build/debug/BianzhongApp")) == false)
+
+        // (c) setFeishuSensorEnabled updates only top-level key and preserves inline comments
+        let cfgURL = dir.appendingPathComponent("config.yml")
+        let initialCfg = """
+        # Top comment
+        triage:
+          feishu_sensor_enabled: true
+        feishu_sensor_enabled: true   # keep this comment
+        """
+        try initialCfg.write(to: cfgURL, atomically: true, encoding: .utf8)
+        try AppConfig.setFeishuSensorEnabled(false, in: cfgURL)
+        let updatedCfg = try String(contentsOf: cfgURL, encoding: .utf8)
+        #expect(updatedCfg.contains("  feishu_sensor_enabled: true"))
+        #expect(updatedCfg.contains("feishu_sensor_enabled: false   # keep this comment"))
+        #expect(AppConfig.load(from: cfgURL).feishuSensorEnabled == false)
+    }
 }

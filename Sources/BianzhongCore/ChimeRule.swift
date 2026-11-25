@@ -90,6 +90,7 @@ public struct AppConfig: Sendable, Equatable {
     public var agentCLIDriver: String
     public var agentCLIModel: String?
     public var terminal: String
+    public var feishuSensorEnabled: Bool
     public var maxConcurrentRuns: Int
     public var maxCausalDepth: Int
     public var dailyMaxCostUSD: Double
@@ -106,6 +107,7 @@ public struct AppConfig: Sendable, Equatable {
         agentCLIDriver: String = "omp",
         agentCLIModel: String? = "smol",
         terminal: String = "auto",
+        feishuSensorEnabled: Bool = true,
         maxConcurrentRuns: Int = 2,
         maxCausalDepth: Int = 1,
         dailyMaxCostUSD: Double = 3.0,
@@ -121,6 +123,7 @@ public struct AppConfig: Sendable, Equatable {
         self.agentCLIDriver = agentCLIDriver
         self.agentCLIModel = agentCLIModel
         self.terminal = terminal
+        self.feishuSensorEnabled = feishuSensorEnabled
         self.maxConcurrentRuns = maxConcurrentRuns
         self.maxCausalDepth = maxCausalDepth
         self.dailyMaxCostUSD = dailyMaxCostUSD
@@ -203,6 +206,7 @@ public struct AppConfig: Sendable, Equatable {
         let val = unquote(value)
         switch key {
         case "terminal": config.terminal = val
+        case "feishu_sensor_enabled": config.feishuSensorEnabled = parseBool(val, default: config.feishuSensorEnabled)
         case "max_concurrent_runs": config.maxConcurrentRuns = max(1, Int(val) ?? config.maxConcurrentRuns)
         case "max_causal_depth": config.maxCausalDepth = max(1, Int(val) ?? config.maxCausalDepth)
         case "daily_max_cost_usd": config.dailyMaxCostUSD = max(0, Double(val) ?? config.dailyMaxCostUSD)
@@ -211,6 +215,43 @@ public struct AppConfig: Sendable, Equatable {
         case "retention_days": config.retentionDays = max(1, Int(val) ?? config.retentionDays)
         default: break
         }
+    }
+
+    /// Updates or inserts `feishu_sensor_enabled` at top level inside `config.yml` without disturbing nested keys or comments.
+    public static func setFeishuSensorEnabled(_ enabled: Bool, in configFile: URL) throws {
+        let existing = (try? String(contentsOf: configFile, encoding: .utf8)) ?? ""
+        var lines = existing.components(separatedBy: .newlines)
+        var replaced = false
+        for idx in lines.indices {
+            let line = lines[idx]
+            let isTopLevel = line.prefix { $0 == " " || $0 == "\t" }.isEmpty
+            guard isTopLevel,
+                  let (k, _) = splitKeyValue(stripComment(line)),
+                  k == "feishu_sensor_enabled" else {
+                continue
+            }
+            if let hashIdx = line.firstIndex(of: "#") {
+                lines[idx] = "feishu_sensor_enabled: \(enabled)   \(line[hashIdx...])"
+            } else {
+                lines[idx] = "feishu_sensor_enabled: \(enabled)"
+            }
+            replaced = true
+            break
+        }
+        if !replaced {
+            if let firstNonComment = lines.firstIndex(where: { line in
+                let t = line.trimmingCharacters(in: .whitespaces)
+                return !t.isEmpty && !t.hasPrefix("#")
+            }) {
+                lines.insert("feishu_sensor_enabled: \(enabled)", at: firstNonComment)
+            } else {
+                lines.append("feishu_sensor_enabled: \(enabled)")
+            }
+        }
+        try FileManager.default.createDirectory(at: configFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let content = lines.joined(separator: "\n")
+        try (content.hasSuffix("\n") ? content : content + "\n")
+            .write(to: configFile, atomically: true, encoding: .utf8)
     }
 
     private static func applyTriage(_ key: String, _ value: String, to config: inout AppConfig) {

@@ -14,20 +14,21 @@
 
 Bianzhong connects local event sources to CLI agents you already use, such as `omp` and `codex`. Event filtering, SQLite state persistence, and subprocess orchestration stay local by default with no relay service, no custom agent harness, and no patches to upstream agent codebases.
 
-The project currently ships the menu bar and daemon app `Bianzhong.app`, the `bz` CLI, the isolated read-only Feishu notification sensor `BianzhongFeishuSensor.app`, and the shared `BianzhongCore` library. **Clipboard watching, FSEvents workspace monitoring, built-in cron schedules, and LaunchAgent auto-start are not yet implemented** and belong to later milestones; the current release focuses on read-only Notification Center capture for Feishu, failed slow-command hooks in Zsh, and script ingestion via `bz emit`.
+The project ships as a single application bundle: `Bianzhong.app` embeds the menu bar inbox, daemon, in-process Feishu notification monitor, and the `bz` CLI. Opening `Bianzhong.app` initializes default templates and automatically symlinks `bz` into your `PATH`. **Clipboard watching, FSEvents workspace monitoring, built-in cron schedules, and LaunchAgent auto-start are not yet implemented** and belong to later milestones; the current release focuses on read-only Notification Center capture for Feishu, failed slow-command hooks in Zsh, and script ingestion via `bz emit`.
 
 <p align="center">
   <a href="docs/00-mvp-architecture-and-roadmap.md">Architecture & roadmap</a> · <a href="docs/research/01-macos-perception-and-hammerspoon2.md">macOS perception notes</a><br>
   <a href="docs/research/03-agent-dispatch-and-lifecycle.md">Agent dispatch & lifecycle</a> · <a href="docs/research/04-trigger-funnel-permissions-and-hitl.md">Funnel & approval model</a>
 </p>
 
-The latest published release is **v0.1.0** (macOS 26 Apple Silicon preview). The installation examples below reference the **v0.1.0** release artifacts on GitHub.
+The latest published release is **v0.2.0** (macOS 26 Apple Silicon single-app preview). The install examples below reference the **v0.2.0** release artifacts on GitHub.
 
 [Features](#features) · [Screenshots](#screenshots) · [Install](#install) · [Usage](#usage) · [Project and licensing](#project-and-licensing) · [Dev](#dev)
 
 ## Features
 
-- Multi-source local perception: `BianzhongFeishuSensor.app` reads `com.electron.lark` notification records read-only from `usernoted`, `bz shell-hook zsh` reports slow failed shell commands, and `bz emit` or the `ingest.sock` Unix Domain Socket accepts custom scripts and webhooks.
+- Single-app setup: `Bianzhong.app` bundles both the `bz` CLI and Feishu Notification Center watcher, symlinking `bz` into `~/.local/bin/bz` (and `/opt/homebrew/bin/bz` when writable) on launch, with a menu bar Integrations menu to toggle `~/.zshrc` hooks.
+- Multi-source local perception: reads `com.electron.lark` notification records read-only from `usernoted`, receives failed slow commands via `bz shell-hook zsh`, and ingests custom scripts or webhooks through `bz emit` and `ingest.sock`.
 - Deterministic L0 funnel: drops `restricted` privacy events before any database write, blocks feedback loops across four layers (causal depth, self-source exclusion, active write leases, and echo hashes), and filters noise via wildcard/keyword rules, TTL dedup, trailing debounce coalescing, and cooldown locks without touching an LLM.
 - Pluggable L1 triage: supports on-device macOS 26 `FoundationModels` (`apple_fm`), a lightweight model via `omp` or `codex` (`agent_cli`), an external HTTP `decision_api` gateway, or rule pass-through (`none`).
 - Two-phase agent execution: spawns `omp` or `codex` on demand in an isolated process group (`posix_spawn`) with zero idle daemon footprint; Phase 1 runs read-only investigation and drafting, while Phase 2 enters `workspace-write` or an isolated Git worktree only after human approval.
@@ -42,7 +43,7 @@ The latest published release is **v0.1.0** (macOS 26 Apple Silicon preview). The
 </p>
 
 <p align="center">
-  <em>Menu bar inbox and macOS notification actions rendered from sample events, showing a Feishu reply draft, a test-failure review card, and interactive notification controls.</em>
+  <em>Menu bar inbox and macOS notification actions rendered from sample events, showing a Feishu reply draft, a test-failure review card, the Integrations menu, and interactive notification controls.</em>
 </p>
 
 <p align="center">
@@ -57,43 +58,43 @@ The latest published release is **v0.1.0** (macOS 26 Apple Silicon preview). The
 
 Requires **macOS 26** (Apple Silicon / `arm64`). Building from source requires Swift **6.2+** (Xcode 26 or Apple Command Line Tools).
 
+### .dmg or .tar.gz (single-app install)
+
+Download the latest `.dmg` from [Releases](https://github.com/chorust/bianzhong/releases), drag `Bianzhong.app` into `/Applications/`, and open it once—default configuration and `bz` CLI symlinks are created automatically. Or download and verify the tarball from a terminal:
+
+```bash
+workdir="$(mktemp -d)"
+cd "$workdir"
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/Bianzhong-0.2.0-macos26-arm64.tar.gz
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/SHA256SUMS.txt
+shasum -a 256 --ignore-missing -c SHA256SUMS.txt
+tar -xzf Bianzhong-0.2.0-macos26-arm64.tar.gz
+cp -R "Bianzhong-0.2.0/Bianzhong.app" /Applications/
+open /Applications/Bianzhong.app
+```
+
+If `bz` is not yet in your `PATH`, add `~/.local/bin` or click `集成 -> 写入 Zsh 慢命令钩子 (~/.zshrc)` in the menu bar.
+
 ### .pkg installer
 
-Download the verified `v0.1.0` installer package, verify its SHA-256 digest, and install both apps into `/Applications/` and `bz` into `/usr/local/bin/bz`:
+You can also install `Bianzhong.app` into `/Applications/` and `/usr/local/bin/bz` with the `.pkg` installer:
 
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.1.0/Bianzhong-0.1.0-macos26-arm64.pkg
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.1.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/Bianzhong-0.2.0-macos26-arm64.pkg
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-sudo installer -pkg Bianzhong-0.1.0-macos26-arm64.pkg -target /
+sudo installer -pkg Bianzhong-0.2.0-macos26-arm64.pkg -target /
 ```
 
-### Standalone archive and .dmg
-
-You can also drag the apps out of the `.dmg` image, or verify and unpack the `.tar.gz` archive directly:
+Prebuilt bundles are ad-hoc signed without Apple notarization. After verifying checksums, clear quarantine attributes if Gatekeeper prompts on first launch:
 
 ```bash
-mkdir -p "$HOME/.local/bin"
-workdir="$(mktemp -d)"
-cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.1.0/Bianzhong-0.1.0-macos26-arm64.tar.gz
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.1.0/SHA256SUMS.txt
-shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-tar -xzf Bianzhong-0.1.0-macos26-arm64.tar.gz
-cp -R "Bianzhong-0.1.0/Bianzhong.app" /Applications/
-cp -R "Bianzhong-0.1.0/BianzhongFeishuSensor.app" /Applications/
-install -m 755 "Bianzhong-0.1.0/bz" "$HOME/.local/bin/bz"
+xattr -cr /Applications/Bianzhong.app
 ```
 
-The `v0.1.0` prebuilt bundles use ad-hoc signing (`codesign -s -`) and are not notarized by Apple. After verifying checksums, clear quarantine attributes before first launch if Gatekeeper prompts:
-
-```bash
-xattr -cr /Applications/Bianzhong.app /Applications/BianzhongFeishuSensor.app
-```
-
-CLI-only hooks and `bz emit` require no extra macOS privacy permissions. For Feishu Notification Center monitoring, grant Full Disk Access solely to `/Applications/BianzhongFeishuSensor.app` in System Settings -> Privacy & Security -> Full Disk Access; `Bianzhong.app` and spawned agents remain Zero-TCC.
+Shell hooks, CI webhooks, and `bz emit` require no macOS privacy permissions. For built-in Feishu Notification Center capture, grant Full Disk Access to `/Applications/Bianzhong.app` via System Settings -> Privacy & Security -> Full Disk Access. Note that in single-app mode, child CLI agents spawned by `Bianzhong.app` inherit its TCC permissions under macOS rules; if you prefer zero TCC exposure, disable `feishu_sensor_enabled` in the menu bar or `config.yml`.
 
 ### Build from source
 
@@ -104,25 +105,18 @@ git clone https://github.com/chorust/bianzhong.git
 cd bianzhong
 bash scripts/setup-signing-cert.sh
 bash scripts/bundle-app.sh
+open dist/Bianzhong.app
 ```
-
-`setup-signing-cert.sh` creates a local self-signed code-signing identity in your login keychain so macOS privacy grants survive rebuilds. If skipped, `bundle-app.sh` falls back to ad-hoc signing.
 
 ## Usage
 
 ### Config
 
-Initialize default templates in `~/.config/bianzhong/` and start the menu bar app:
-
-```bash
-bz init
-open /Applications/Bianzhong.app
-```
-
-Global settings live in `~/.config/bianzhong/config.yml` and trigger rules live in `~/.config/bianzhong/chimes/*.md`:
+Opening `Bianzhong.app` creates `~/.config/bianzhong/` automatically (or run `bz init`). Global settings live in `~/.config/bianzhong/config.yml` and trigger rules live in `~/.config/bianzhong/chimes/*.md`:
 
 ```yaml
 terminal: auto
+feishu_sensor_enabled: true
 max_concurrent_runs: 2
 max_causal_depth: 1
 
@@ -143,20 +137,15 @@ workspaces:
     summary: "Order and refund service"
 ```
 
-Run `bz config` (or click `+ 配规则` in the menu bar) to open `omp` or `codex` in `~/.config/bianzhong` with `AGENTS.md` preloaded, then apply changes with:
-
-```bash
-bz reload
-```
+Run `bz config` (or click `+ 配规则` in the menu bar) to open `omp` or `codex` in `~/.config/bianzhong` with `AGENTS.md` loaded, then apply edits with `bz reload`.
 
 ### Scenarios
 
 - **Feishu on-call triage & reply drafting**
 
-  Start `BianzhongFeishuSensor.app` after granting it Full Disk Access. Bursts of group messages matching your keywords coalesce within the debounce window, trigger a read-only investigation paired with the last 20 minutes of local timeline context, and surface a short reply draft:
+  With `feishu_sensor_enabled: true` and Full Disk Access granted to `Bianzhong.app`, bursts of group messages matching your keywords coalesce within the debounce window, trigger a read-only investigation paired with the last 20 minutes of local timeline context, and surface a short reply draft:
 
   ```bash
-  open /Applications/BianzhongFeishuSensor.app
   bz status
   ```
 
@@ -164,10 +153,10 @@ bz reload
 
 - **Slow shell command failure diagnosis**
 
-  Source the Zsh hook in `~/.zshrc` to report commands that run for at least 15 seconds and exit non-zero (excluding `Ctrl+C` exit code `130`):
+  Enable the Zsh hook from the menu bar Integrations menu (or run `bz install-cli --zsh`) to report commands that run for at least 15 seconds and exit non-zero (excluding `Ctrl+C` exit code `130`):
 
   ```bash
-  eval "$(bz shell-hook zsh)"
+  source ~/.zshrc
   ```
 
   Bianzhong surfaces the failure summary in the menu bar so you can jump straight into the underlying agent session with "终端接管 ↗".
@@ -222,12 +211,12 @@ The software is licensed under [Apache-2.0](LICENSE), allowing commercial use. L
 
 ## Dev
 
-Build all four Swift targets, run the test suite, and package release installers locally:
+Build all targets, run the test suite, and package single-app installers locally:
 
 ```bash
 swift build
 bash scripts/test.sh
-bash scripts/package-release.sh 0.1.0
+bash scripts/package-release.sh 0.2.0
 ```
 
-The default suite contains 18 unit and integration tests running offline in isolated temporary directories without network calls or live LLM requests. GitHub Actions runs [CI](.github/workflows/ci.yml) on pushes/PRs and [Release](.github/workflows/release.yml) on `v*` tags using `macos-26` runners. Live `usernoted` database reads, interactive system notification callbacks, terminal handoff launches, and live model triage must be verified locally on macOS 26.
+Tests run offline in isolated temporary directories without network calls or live LLM requests. GitHub Actions runs [CI](.github/workflows/ci.yml) on pushes/PRs and [Release](.github/workflows/release.yml) on `v*` tags using `macos-26` runners. Live `usernoted` database reads, interactive system notification callbacks, terminal handoff launches, and live model triage must be verified locally on macOS 26.

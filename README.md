@@ -14,20 +14,21 @@
 
 Bianzhong（编钟）连接本机事件源与你自备的 CLI Agent（如 `omp`、`codex`）。所有事件过滤、SQLite 状态记录和子进程调度均在本地完成，不依赖中转服务，也不自研 Agent Harness 或修改上游 Agent 源码。
 
-当前提供菜单栏与守护进程应用 `Bianzhong.app`、命令行工具 `bz`、独立只读飞书通知传感器 `BianzhongFeishuSensor.app` 以及共用核心库 `BianzhongCore`。**剪贴板监听、工作区 FSEvents 监听、内置 Cron 调度与 LaunchAgent 开机自启尚未实现**，属于后续里程碑；当前版本聚焦飞书通知中心只读读取、Zsh 慢命令失败钩子与 `bz emit` 脚本接入。
+项目采用单应用形态打包：一个 `Bianzhong.app` 同时承担菜单栏听音台、守护进程、内置飞书通知监听和内嵌 `bz` 命令行工具；首次打开时自动初始化默认配置并将 `bz` 软链到常用 `PATH` 目录。**剪贴板监听、工作区 FSEvents 监听、内置 Cron 调度与 LaunchAgent 开机自启尚未实现**，属于后续里程碑；当前版本聚焦飞书通知中心读取、Zsh 慢命令失败钩子与 `bz emit` 脚本接入。
 
 <p align="center">
   <a href="docs/00-mvp-architecture-and-roadmap.md">架构与路线图</a> · <a href="docs/research/01-macos-perception-and-hammerspoon2.md">macOS 感知调研</a><br>
   <a href="docs/research/03-agent-dispatch-and-lifecycle.md">Agent 调度机制</a> · <a href="docs/research/04-trigger-funnel-permissions-and-hitl.md">触发漏斗与审批</a>
 </p>
 
-最新已发布版本为 **v0.1.0**（macOS 26 Apple Silicon 预览版）；下方安装示例对应 GitHub Release 上的 **v0.1.0** 产物。
+最新已发布版本为 **v0.2.0**（macOS 26 Apple Silicon 单应用预览版）；下方安装示例对应 GitHub Release 上的 **v0.2.0** 产物。
 
 [Features](#features) · [Screenshots](#screenshots) · [Install](#install) · [Usage](#usage) · [项目与许可](#项目与许可) · [Dev](#dev)
 
 ## Features
 
-- 多源本地信号接入：通过 `BianzhongFeishuSensor.app` 只读读取 `usernoted` 中的 `com.electron.lark` 飞书通知、接入 Zsh 慢命令失败钩子，或经 `bz emit` 与 Unix Domain Socket `ingest.sock` 接入外部事件。
+- 单应用开箱即用：`Bianzhong.app` 内置 `bz` 命令行与飞书通知监听，启动时自动把 `bz` 软链到 `~/.local/bin/bz`（如 `/opt/homebrew/bin` 可写也会一并创建），并在菜单栏「集成」中一键管理 `~/.zshrc` 钩子。
+- 多源本地信号接入：内置传感器只读查询 `usernoted` 中的 `com.electron.lark` 飞书通知；Zsh 慢命令钩子自动上报耗时失败命令；外部脚本经 `bz emit` 或 Unix Domain Socket `ingest.sock` 推送事件。
 - L0 确定性漏斗：`restricted` 隐私事件落库前直接丢弃；通过因果深度、自源排除、写路径租约与回声指纹阻断循环触发，再经通配符与关键词匹配、TTL 去重、尾随防抖合并及冷却锁过滤噪声，这一层不调用大模型。
 - 可选 L1 语义分诊：支持 macOS 26 本地 `FoundationModels`（`apple_fm`）、指定轻量模型的 `omp` / `codex`（`agent_cli`）、外部 HTTP 接口（`decision_api`）以及直通放行（`none`）。
 - 两阶段 Agent 调度：按需通过 `posix_spawn` 在独立进程组拉起 `omp` 或 `codex`，空闲时无常驻进程；Phase 1 限制只读工具集或 `read-only` 沙箱完成勘察与拟稿，批准后再进入可写模式的 Phase 2，并可为修复任务创建独立 Git Worktree。
@@ -42,7 +43,7 @@ Bianzhong（编钟）连接本机事件源与你自备的 CLI Agent（如 `omp`�
 </p>
 
 <p align="center">
-  <em>菜单栏听音台与 macOS 交互通知视图（基于示例事件渲染，展示飞书群排查草稿、测试失败审批卡片与通知操作）。</em>
+  <em>菜单栏听音台与 macOS 交互通知视图（基于示例事件渲染，展示飞书群排查草稿、测试失败审批卡片、集成菜单与通知操作）。</em>
 </p>
 
 <p align="center">
@@ -57,74 +58,65 @@ Bianzhong（编钟）连接本机事件源与你自备的 CLI Agent（如 `omp`�
 
 需要 **macOS 26**（Apple Silicon / `arm64`）；从源码编译还需要 Swift **6.2+**（Xcode 26 或 Apple Command Line Tools）。
 
+### .dmg 拖拽或 .tar.gz 解压（推荐，单 App 即装即用）
+
+从 [Releases](https://github.com/chorust/bianzhong/releases) 下载最新 `.dmg` 镜像并把 `Bianzhong.app` 拖入 `/Applications/`，打开后即自动完成配置初始化与 `bz` 命令安装。也可以通过终端下载 `.tar.gz` 校验并复制：
+
+```bash
+workdir="$(mktemp -d)"
+cd "$workdir"
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/Bianzhong-0.2.0-macos26-arm64.tar.gz
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/SHA256SUMS.txt
+shasum -a 256 --ignore-missing -c SHA256SUMS.txt
+tar -xzf Bianzhong-0.2.0-macos26-arm64.tar.gz
+cp -R "Bianzhong-0.2.0/Bianzhong.app" /Applications/
+open /Applications/Bianzhong.app
+```
+
+如果新终端里找不到 `bz`，确认 `~/.local/bin` 已在 `PATH` 中，或在菜单栏点击「集成 -> 写入 Zsh 慢命令钩子 (~/.zshrc)」（会一并写入 `export PATH="$HOME/.local/bin:$PATH"`）。
+
 ### .pkg 安装包
 
-下载 `v0.1.0` 安装包，校验 SHA-256 后安装到 `/Applications/` 与 `/usr/local/bin/bz`：
+也可以使用 `.pkg` 安装器一步写入 `/Applications/Bianzhong.app` 与 `/usr/local/bin/bz`：
 
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.1.0/Bianzhong-0.1.0-macos26-arm64.pkg
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.1.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/Bianzhong-0.2.0-macos26-arm64.pkg
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.2.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-sudo installer -pkg Bianzhong-0.1.0-macos26-arm64.pkg -target /
+sudo installer -pkg Bianzhong-0.2.0-macos26-arm64.pkg -target /
 ```
 
-安装完成后，`Bianzhong.app` 与 `BianzhongFeishuSensor.app` 位于 `/Applications/`，`bz` 位于 `/usr/local/bin/bz`。
-
-### 独立预编译包与 .dmg
-
-如果不想使用系统安装器，可以直接下载 `.dmg` 镜像拖拽安装，或通过 `.tar.gz` 解压到用户目录：
+未配置 Apple Developer ID 公证时，首次打开预编译包若遇到 Gatekeeper 提示，确认校验和无误后执行：
 
 ```bash
-mkdir -p "$HOME/.local/bin"
-workdir="$(mktemp -d)"
-cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.1.0/Bianzhong-0.1.0-macos26-arm64.tar.gz
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.1.0/SHA256SUMS.txt
-shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-tar -xzf Bianzhong-0.1.0-macos26-arm64.tar.gz
-cp -R "Bianzhong-0.1.0/Bianzhong.app" /Applications/
-cp -R "Bianzhong-0.1.0/BianzhongFeishuSensor.app" /Applications/
-install -m 755 "Bianzhong-0.1.0/bz" "$HOME/.local/bin/bz"
+xattr -cr /Applications/Bianzhong.app
 ```
 
-`v0.1.0` 预编译包当前使用 Ad-hoc 签名且未经过 Apple 公证，首次启动可能触发 Gatekeeper 拦截。确认校验和无误后，可执行：
-
-```bash
-xattr -cr /Applications/Bianzhong.app /Applications/BianzhongFeishuSensor.app
-```
-
-如果只测试终端钩子与 `bz emit`，不需要额外系统权限；若需读取飞书通知，只需在「系统设置 -> 隐私与安全性 -> 完全磁盘访问权限」中授予 `/Applications/BianzhongFeishuSensor.app`，主程序与下游 Agent 不申请该权限。
+如果只使用终端慢命令钩子、CI Webhook 与 `bz emit`，不需要任何系统隐私权限；若要直接读取飞书通知中心消息，只需按菜单栏黄色横幅引导「系统设置 -> 隐私与安全性 -> 完全磁盘访问权限」授予 `Bianzhong.app` 一次即可。单应用模式下，由 `Bianzhong.app` 拉起的下游 Agent 会按 macOS TCC 规则继承该权限，介意这一点的环境可在菜单栏或 `config.yml` 中关闭 `feishu_sensor_enabled`。
 
 ### 从源码构建
 
-在仓库根目录编译并打包本地 `.app`（调试阶段可加 `--debug`）：
+在仓库根目录编译并打包单个 `Bianzhong.app`（调试阶段可加 `--debug`）：
 
 ```bash
 git clone https://github.com/chorust/bianzhong.git
 cd bianzhong
 bash scripts/setup-signing-cert.sh
 bash scripts/bundle-app.sh
+open dist/Bianzhong.app
 ```
-
-`setup-signing-cert.sh` 会在登录钥匙串创建本地自签名代码签名证书，避免重编后丢失已授予的系统权限。如果不需要本地签名，跳过这一步会默认回退到 Ad-hoc 签名。
 
 ## Usage
 
 ### Config
 
-先初始化配置目录并启动守护进程：
-
-```bash
-bz init
-open /Applications/Bianzhong.app
-```
-
-配置位于 `~/.config/bianzhong/config.yml`，规则位于 `~/.config/bianzhong/chimes/*.md`。下面是一个常用 `config.yml` 示例：
+打开 `Bianzhong.app` 后会自动生成配置目录（也可在终端运行 `bz init`）。全局配置位于 `~/.config/bianzhong/config.yml`，规则位于 `~/.config/bianzhong/chimes/*.md`：
 
 ```yaml
 terminal: auto
+feishu_sensor_enabled: true
 max_concurrent_runs: 2
 max_causal_depth: 1
 
@@ -145,34 +137,29 @@ workspaces:
     summary: "Order and refund service"
 ```
 
-如果需要调整或新增规则，运行 `bz config` 会以 `~/.config/bianzhong` 为工作目录打开 `omp` 或 `codex`（也可点击菜单栏「+ 配规则」）。修改完成后点击菜单栏「重载」或执行：
-
-```bash
-bz reload
-```
+如果需要调整或新增规则，运行 `bz config` 会以 `~/.config/bianzhong` 为工作目录打开 `omp` 或 `codex`（也可点击菜单栏「+ 配规则」）。修改完成后点击菜单栏「重载」或执行 `bz reload` 生效。
 
 ### 使用场景
 
 - **飞书告警群排查与回复拟稿**
 
-  开启飞书传感器后，群内的报错、`500` 或 `@` 通知会先经 `debounce` 窗口合并连续消息，再拉起只读 Agent 结合最近 20 分钟本地关联时间线排查原因，最后在听音台和系统通知里生成可直接复制的中文回复草稿：
+  确保飞书通知监听处于开启状态并授予 `Bianzhong.app` 完全磁盘访问权限后，群内的报错、`500` 或 `@` 通知会经 `debounce` 窗口合并，再拉起只读 Agent 结合最近 20 分钟本地时间线排查原因，在通知横幅和菜单栏生成中文答复草稿：
 
   ```bash
-  open /Applications/BianzhongFeishuSensor.app
   bz status
   ```
 
-  在通知或菜单栏点击「复制并回飞书」，草稿会带上 `TransientType` 标记写入剪贴板并切回飞书窗口。
+  点击「复制并回飞书」，草稿会带上 `TransientType` 标记写入剪贴板并切回飞书窗口。
 
 - **终端慢命令失败诊断**
 
-  在 `~/.zshrc` 加入钩子后，终端里耗时达到 15 秒且非手动 `Ctrl+C` 中断（`exit_code != 130`）的失败命令会在后台静默上报目录与退出码：
+  在菜单栏点击「集成 -> 写入 Zsh 慢命令钩子 (~/.zshrc)」（或运行 `bz install-cli --zsh`），终端里耗时达到 15 秒且非 `Ctrl+C` 中断（`exit_code != 130`）的失败命令会在后台静默上报目录与退出码：
 
   ```bash
-  eval "$(bz shell-hook zsh)"
+  source ~/.zshrc
   ```
 
-  当测试或构建长时间执行失败时，听音台会自动列出失败归因摘要，点击「终端接管 ↗」可在你配置的终端里直接恢复对应 `omp` 或 `codex` 会话。
+  构建或测试长时间执行失败时，听音台会给出排查摘要，点击「终端接管 ↗」可直接恢复对应 `omp` 或 `codex` 会话继续操作。
 
 - **CI 失败与人工批准后隔离修复**
 
@@ -214,11 +201,11 @@ bz reload
 
 ## 项目与许可
 
-Bianzhong 专注于保持核心运行时足够薄，把模型工具循环、上下文压缩与沙箱能力留给下游 CLI Agent 自身承担。各模块与后续演进说明见：
+Bianzhong 把运行时本身保持精薄，将工具调用循环、上下文压缩和沙箱交给外部 CLI Agent 处理。各模块设计与调研记录见：
 
 [架构设计与路线图](docs/00-mvp-architecture-and-roadmap.md) · [macOS 感知与 Hammerspoon 2 调研](docs/research/01-macos-perception-and-hammerspoon2.md) · [同类生态调研](docs/research/02-ecosystem-and-prior-art.md) · [Agent 调度与生命周期](docs/research/03-agent-dispatch-and-lifecycle.md) · [触发漏斗与 HITL 设计](docs/research/04-trigger-funnel-permissions-and-hitl.md)
 
-软件采用标准 [Apache-2.0](LICENSE) 许可，允许商业使用。Bianzhong 调度的第三方 CLI Agent（如 `omp`、`codex`）、外部模型网关以及本机通知与仓库数据的权限管理与使用条款，各自归属对应软件与数据来源。
+软件采用标准 [Apache-2.0](LICENSE) 许可，允许商业使用。所调度的第三方 CLI Agent（如 `omp`、`codex`）、外部模型接口以及本机通知和仓库数据的访问权限各自适用对应软件与来源的规定。
 
 ## Dev
 
@@ -227,7 +214,7 @@ Bianzhong 专注于保持核心运行时足够薄，把模型工具循环、上�
 ```bash
 swift build
 bash scripts/test.sh
-bash scripts/package-release.sh 0.1.0
+bash scripts/package-release.sh 0.2.0
 ```
 
-默认测试套件包含 18 项单元与集成测试，全部在临时目录离线运行，不访问公网也不调用线上大模型。GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 和 [Release 发布工作流](.github/workflows/release.yml) 均运行在 `macos-26` Runner 上，分别用于每次推送验证和 `v*` 标签自动发布安装包。真实通知中心数据库读取、系统通知操作回调与在线模型分诊需要在本地 macOS 26 环境单独验收。
+默认测试套件在临时目录离线运行，不访问公网也不调用线上大模型。GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 和 [Release 发布工作流](.github/workflows/release.yml) 均运行在 `macos-26` Runner 上，分别用于每次推送验证和 `v*` 标签自动发布安装包。真实通知中心数据库读取、系统通知操作回调与在线模型分诊需要在本地 macOS 26 环境单独验收。
