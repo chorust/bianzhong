@@ -21,7 +21,13 @@ rm -rf "$RELEASE_DIR"
 mkdir -p "$RELEASE_DIR"
 
 STAGE_DIR="$(mktemp -d /tmp/bz-release-XXXXXX)"
-trap 'rm -rf "$STAGE_DIR"' EXIT
+cleanup() {
+  if [[ -d "$STAGE_DIR/mnt" ]]; then
+    hdiutil detach "$STAGE_DIR/mnt" -force -quiet >/dev/null 2>&1 || true
+  fi
+  rm -rf "$STAGE_DIR"
+}
+trap cleanup EXIT
 
 # 1. Build macOS Installer (.pkg) installing Bianzhong.app into /Applications and symlink /usr/local/bin/bz
 PKGROOT="$STAGE_DIR/pkgroot"
@@ -54,38 +60,57 @@ fi
 pkgbuild "${PKG_ARGS[@]}" "$PKG_PATH"
 
 # 2. Build single-app drag-and-drop macOS Disk Image (.dmg)
-DMGROOT="$STAGE_DIR/dmg"
-mkdir -p "$DMGROOT"
-ditto "$ROOT_DIR/dist/Bianzhong.app" "$DMGROOT/Bianzhong.app"
-cp -R "$ROOT_DIR/templates" "$DMGROOT/templates"
-ln -s /Applications "$DMGROOT/Applications"
+VOL_NAME="Bianzhong ${CLEAN_VERSION}"
+RW_DMG="$STAGE_DIR/rw.dmg"
+MOUNT_DIR="$STAGE_DIR/mnt"
+mkdir -p "$MOUNT_DIR"
 
-cat > "$DMGROOT/INSTALL.txt" <<'EOF'
-Bianzhong（编钟）for macOS 26 (arm64)
-======================================
+hdiutil create \
+  -size 48m \
+  -fs HFS+ \
+  -volname "$VOL_NAME" \
+  -nospotlight \
+  -type UDIF \
+  -ov \
+  "$RW_DMG"
 
-单应用安装步骤（或直接运行 .pkg 安装包）：
-1. 将 Bianzhong.app 拖入 Applications 文件夹并打开。
-2. 首次启动会自动：
-   - 初始化 ~/.config/bianzhong/ 默认配置与示例规则
-   - 自动将 bz 命令软链到 ~/.local/bin/bz（若 /opt/homebrew/bin 可写也会一并创建）
-3. 如需接入终端慢命令钩子：点击菜单栏「集成 -> 写入 Zsh 慢命令钩子 (~/.zshrc)」，或运行：
-   bz install-cli --zsh
+hdiutil attach \
+  -readwrite \
+  -noverify \
+  -noautoopen \
+  -nobrowse \
+  -mountpoint "$MOUNT_DIR" \
+  "$RW_DMG"
 
-权限与 Gatekeeper 说明（未配 Apple Developer ID 公证时）：
-- 若首次打开提示“无法验证开发者/已损坏”，执行：
-  xattr -cr /Applications/Bianzhong.app
-- 如使用内置飞书通知监听，在「系统设置 -> 隐私与安全性 -> 完全磁盘访问权限」中授予 Bianzhong.app；
-  不需要该监听时可在菜单栏「集成 -> 关闭飞书通知监听」关闭（完全零额外权限）。
-EOF
+ditto "$ROOT_DIR/dist/Bianzhong.app" "$MOUNT_DIR/Bianzhong.app"
+ln -s /Applications "$MOUNT_DIR/Applications"
+cp "$ROOT_DIR/dist/Bianzhong.app/Contents/Resources/AppIcon.icns" "$MOUNT_DIR/.VolumeIcon.icns"
+
+swift "$ROOT_DIR/scripts/generate-installer-assets.swift" \
+  --dmg-bg "$MOUNT_DIR/.background.tiff"
+
+chflags hidden "$MOUNT_DIR/.background.tiff" "$MOUNT_DIR/.VolumeIcon.icns" || true
+SETFILE_BIN="$(command -v SetFile || xcrun --find SetFile 2>/dev/null || true)"
+if [[ -n "$SETFILE_BIN" ]]; then
+  "$SETFILE_BIN" -a V "$MOUNT_DIR/.background.tiff" "$MOUNT_DIR/.VolumeIcon.icns" || true
+  "$SETFILE_BIN" -a C "$MOUNT_DIR" || true
+fi
+xattr -wx com.apple.FinderInfo 0000000000000000040000000000000000000000000000000000000000000000 "$MOUNT_DIR"
+
+/usr/bin/python3 "$ROOT_DIR/scripts/build-dmg-dsstore.py" \
+  --mount-dir "$MOUNT_DIR" \
+  --vol-name "$VOL_NAME" \
+  --bg-filename ".background.tiff" \
+  --app-name "Bianzhong.app" \
+  --verify
+
+rm -rf "$MOUNT_DIR/.fseventsd" "$MOUNT_DIR/.Trashes" 2>/dev/null || true
+sync
+hdiutil detach "$MOUNT_DIR" -quiet || hdiutil detach "$MOUNT_DIR" -force -quiet
 
 DMG_PATH="$RELEASE_DIR/${ARTIFACT_BASE}.dmg"
-hdiutil create \
-  -volname "Bianzhong ${CLEAN_VERSION}" \
-  -srcfolder "$DMGROOT" \
-  -ov \
-  -format UDZO \
-  "$DMG_PATH"
+hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 -ov -o "$DMG_PATH"
+rm -f "$RW_DMG"
 
 # 3. Build portable tarball (.tar.gz)
 TARROOT="$STAGE_DIR/tar/Bianzhong-${CLEAN_VERSION}"

@@ -18,12 +18,16 @@ BIN_DIR="$ROOT_DIR/.build/$CONFIG"
 
 DIST_DIR="$ROOT_DIR/dist"
 rm -rf "$DIST_DIR/Bianzhong.app" "$DIST_DIR/BianzhongFeishuSensor.app" "$DIST_DIR/bz"
-mkdir -p "$DIST_DIR/Bianzhong.app/Contents/MacOS"
+mkdir -p "$DIST_DIR/Bianzhong.app/Contents/MacOS" "$DIST_DIR/Bianzhong.app/Contents/Resources"
 
 cp "$ROOT_DIR/Sources/BianzhongApp/Info.plist" "$DIST_DIR/Bianzhong.app/Contents/Info.plist"
 cp "$BIN_DIR/BianzhongApp" "$DIST_DIR/Bianzhong.app/Contents/MacOS/BianzhongApp"
 cp "$BIN_DIR/bz" "$DIST_DIR/Bianzhong.app/Contents/MacOS/bz"
 chmod 755 "$DIST_DIR/Bianzhong.app/Contents/MacOS/BianzhongApp" "$DIST_DIR/Bianzhong.app/Contents/MacOS/bz"
+
+swift "$ROOT_DIR/scripts/generate-installer-assets.swift" \
+  --mark "$ROOT_DIR/assets/branding/bianzhong-mark.png" \
+  --icns "$DIST_DIR/Bianzhong.app/Contents/Resources/AppIcon.icns"
 
 cp "$BIN_DIR/bz" "$DIST_DIR/bz"
 chmod 755 "$DIST_DIR/bz"
@@ -54,6 +58,8 @@ else
   codesign --force --sign "$SIGN_ID" "$DIST_DIR/Bianzhong.app/Contents/MacOS/bz"
   codesign --force --deep --sign "$SIGN_ID" "$DIST_DIR/Bianzhong.app"
 fi
+
+codesign --verify --deep --strict "$DIST_DIR/Bianzhong.app"
 
 echo "Bundled:"
 echo "  $DIST_DIR/Bianzhong.app"

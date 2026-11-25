@@ -98,6 +98,7 @@ public final class Orchestrator: @unchecked Sendable {
     private let stateLock = NSLock()
     private var pausedUntil: Date?
     private var pauseTimer: DispatchSourceTimer?
+    private var expectTimer: DispatchSourceTimer?
     private let runGate: ConcurrencyGate
 
     public init(paths: BianzhongPaths = BianzhongPaths(), callbacks: OrchestratorCallbacks = OrchestratorCallbacks()) throws {
@@ -141,6 +142,7 @@ public final class Orchestrator: @unchecked Sendable {
         if enableBuiltInSensors {
             syncFeishuMonitor()
         }
+        startExpectWindowTimer()
 
         let retention = currentConfig().retentionDays
         Task.detached(priority: .background) { [weak self] in
@@ -153,11 +155,14 @@ public final class Orchestrator: @unchecked Sendable {
         stateLock.lock()
         let timer = pauseTimer
         pauseTimer = nil
+        let expTimer = expectTimer
+        expectTimer = nil
         let monitor = feishuMonitor
         feishuMonitor = nil
         builtInSensorsEnabled = false
         stateLock.unlock()
         timer?.cancel()
+        expTimer?.cancel()
         monitor?.stop()
         bus?.stop()
         bus = nil
@@ -166,6 +171,163 @@ public final class Orchestrator: @unchecked Sendable {
     public func feishuSensorStatus() -> FeishuSensorStatus {
         let monitor = stateLock.withLock { feishuMonitor }
         return monitor?.currentStatus() ?? .disabled
+    }
+
+    public func feishuSensorErrorMessage() -> String? {
+        let monitor = stateLock.withLock { feishuMonitor }
+        return monitor?.currentErrorMessage()
+    }
+
+    public func allRules() -> [ChimeRule] {
+        funnel.currentRules()
+    }
+
+    /// Toggles `enabled: true/false` in a rule's Markdown file and reloads all rules immediately.
+    public func setRuleEnabled(id: String, enabled: Bool) throws {
+        guard let rule = funnel.currentRules().first(where: { $0.id == id }) else {
+            throw NSError(domain: "BianzhongOrchestrator", code: 404, userInfo: [NSLocalizedDescriptionKey: "Rule not found: \(id)"])
+        }
+        let targetURL: URL
+        if let path = rule.filePath {
+            targetURL = URL(fileURLWithPath: path)
+        } else {
+            targetURL = paths.chimesDir.appendingPathComponent("\(id).md")
+        }
+        try ChimeRule.setEnabled(enabled, in: targetURL)
+        reloadConfig()
+    }
+
+    private func startExpectWindowTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 5.0, repeating: 30.0)
+        timer.setEventHandler { [weak self] in
+            _ = self?.checkExpectWindows()
+        }
+        let previous: DispatchSourceTimer? = stateLock.withLock {
+            let old = expectTimer
+            expectTimer = timer
+            return old
+        }
+        previous?.cancel()
+        timer.resume()
+    }
+
+    /// Evaluates all enabled rules with an `expect:` time window.
+    /// If a window has elapsed without receiving a matching signal, synthesizes and dispatches
+    /// a `dev.bianzhong.expect.missed` event at most once per period.
+    @discardableResult
+    public func checkExpectWindows(now: Date = Date(), calendar: Calendar = .current) -> [EventEnvelope] {
+        guard !isPaused() else { return [] }
+        let rules = funnel.currentRules()
+        var triggered: [EventEnvelope] = []
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+
+        for rule in rules where rule.enabled {
+            guard let spec = rule.expectWindow, spec.enabled else { continue }
+            guard let resolved = ExpectWindowEvaluator.missedWindow(for: spec, at: now, calendar: calendar) else {
+                continue
+            }
+            let periodKey = resolved.periodKey
+            let existingStatus = (try? store.expectWindowStatus(chimeID: rule.id, periodKey: periodKey)) ?? nil
+            if existingStatus != nil {
+                continue
+            }
+
+            // Guard 1: Do not retroactively fire if the rule file was created/enabled after this window already ended
+            if let modDate = rule.fileModifiedAt, modDate > resolved.deadline {
+                try? store.markExpectWindow(
+                    chimeID: rule.id,
+                    periodKey: periodKey,
+                    status: "satisfied",
+                    matchedEventID: "skipped:late_rule_init",
+                    nowMs: nowMs
+                )
+                continue
+            }
+
+            // Guard 2: Back-check SQLite events received within [start, deadline] before declaring a miss
+            let startMs = Int64(resolved.start.timeIntervalSince1970 * 1000)
+            let deadlineMs = Int64(resolved.deadline.timeIntervalSince1970 * 1000)
+            if let priorEvents = try? store.listEventsReceivedBetween(startMs: startMs, endMs: deadlineMs),
+               let priorHit = priorEvents.first(where: { funnel.matchesRule($0, rule: rule) }) {
+                try? store.markExpectWindow(
+                    chimeID: rule.id,
+                    periodKey: periodKey,
+                    status: "satisfied",
+                    matchedEventID: priorHit.id,
+                    nowMs: nowMs
+                )
+                continue
+            }
+
+            try? store.markExpectWindow(
+                chimeID: rule.id,
+                periodKey: periodKey,
+                status: "missed_triggered",
+                matchedEventID: nil,
+                nowMs: nowMs
+            )
+
+            let descLine = rule.description.isEmpty ? "" : "\n规则说明：\(rule.description)"
+            let missedEvent = EventEnvelope(
+                source: "bz://watchdog/expect",
+                type: "dev.bianzhong.expect.missed",
+                correlationKey: "expect:\(rule.id):\(periodKey)",
+                privacyLevel: .internal,
+                payload: [
+                    "title": "未如期收到信号：\(rule.id)",
+                    "subtitle": "预期窗口 \(spec.windowStart)–\(spec.windowEnd)",
+                    "body": "在预期时间窗口 \(spec.windowStart)–\(spec.windowEnd) (\(periodKey)) 内未收到匹配规则「\(rule.id)」的信号。\(descLine)",
+                    "chime_id": rule.id,
+                    "window_start": spec.windowStart,
+                    "window_end": spec.windowEnd,
+                    "period_key": periodKey
+                ],
+                ambientContext: .captureCurrent()
+            )
+            try? store.recordEvent(missedEvent, funnelStage: "expect_missed", matchedChimeID: rule.id)
+            dispatchMatchedEvent(missedEvent, rule: rule)
+            triggered.append(missedEvent)
+        }
+
+        return triggered
+    }
+
+    /// Directly tests a single target rule from the UI without allowing earlier broad rules to hijack the event.
+    public func triggerRuleTest(ruleID: String, event: EventEnvelope) -> (ok: Bool, message: String) {
+        guard let rule = funnel.currentRules().first(where: { $0.id == ruleID }) else {
+            return (false, "未找到规则：\(ruleID)")
+        }
+        guard rule.enabled else {
+            return (false, "规则当前已停用，请先开启后再触发实测")
+        }
+
+        if let spec = rule.expectWindow, spec.enabled {
+            let descLine = rule.description.isEmpty ? "" : "\n规则说明：\(rule.description)"
+            let testMissed = EventEnvelope(
+                source: "bz://test/expect",
+                type: "dev.bianzhong.expect.missed",
+                correlationKey: "test:expect:\(rule.id)",
+                privacyLevel: .internal,
+                payload: [
+                    "title": "[测试] 未如期收到信号：\(rule.id)",
+                    "subtitle": "预期窗口 \(spec.windowStart)–\(spec.windowEnd)",
+                    "body": "手动实测预期窗口超时动作（\(spec.windowStart)–\(spec.windowEnd)）。\(descLine)",
+                    "chime_id": rule.id
+                ],
+                ambientContext: .captureCurrent()
+            )
+            try? store.recordEvent(testMissed, funnelStage: "dispatched", matchedChimeID: rule.id)
+            dispatchMatchedEvent(testMissed, rule: rule)
+            return (true, "已直接触发规则「\(rule.id)」的超时动作")
+        }
+
+        guard funnel.matchesRule(event, rule: rule) else {
+            return (false, "当前输入未命中规则「\(rule.id)」的 match 条件，未触发")
+        }
+        try? store.recordEvent(event, funnelStage: "dispatched", matchedChimeID: rule.id)
+        dispatchMatchedEvent(event, rule: rule)
+        return (true, "已定向触发规则「\(rule.id)」")
     }
 
     public func retryFeishuSensor() {
@@ -354,6 +516,7 @@ public final class Orchestrator: @unchecked Sendable {
                 return BusResponse(ok: false, message: "Missing event envelope")
             }
             if isPaused() {
+                _ = funnel.recordExpectWindowMatchesWhilePaused(event)
                 try? store.recordEvent(event, funnelStage: "dropped_paused", dropReason: "daemon_paused")
                 return BusResponse(ok: true, message: "Paused", disposition: "paused")
             }
@@ -469,7 +632,7 @@ public final class Orchestrator: @unchecked Sendable {
                 return
             }
 
-            if rule.triageEnabled {
+            if rule.triageEnabled && event.type != "dev.bianzhong.expect.missed" {
                 let provider = TriageProviderFactory.make(config: cfg, override: rule.triageProviderOverride)
                 let req = TriageRequest(
                     event: event,

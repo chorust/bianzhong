@@ -75,6 +75,51 @@ public final class FeishuSensorRunner: @unchecked Sendable {
         try? "\(recID)\n".write(to: cursorURL, atomically: true, encoding: .utf8)
     }
 
+    /// Probes filesystem read access on `dbURL` and its immediate parent directories
+    /// to detect macOS TCC Full Disk Access (`EPERM` / `EACCES`) reliably before SQLite opens.
+    public static func probePermissionDenied(for dbURL: URL) -> Bool {
+        let fd = Darwin.open(dbURL.path, O_RDONLY)
+        if fd >= 0 {
+            Darwin.close(fd)
+            return false
+        }
+        let fileErr = errno
+        if fileErr == EPERM || fileErr == EACCES {
+            return true
+        }
+        var probeDir = dbURL.deletingLastPathComponent()
+        for _ in 0..<3 {
+            let dirFD = Darwin.open(probeDir.path, O_RDONLY)
+            if dirFD >= 0 {
+                Darwin.close(dirFD)
+            } else if errno == EPERM || errno == EACCES {
+                return true
+            }
+            let parent = probeDir.deletingLastPathComponent()
+            if parent.path == probeDir.path { break }
+            probeDir = parent
+        }
+        return false
+    }
+
+    private static func isSQLitePermissionError(rc: Int32, message: String, dbURL: URL) -> Bool {
+        if rc == SQLITE_PERM || rc == SQLITE_AUTH {
+            return true
+        }
+        let lower = message.lowercased()
+        if lower.contains("authorization denied") || lower.contains("not permitted") || lower.contains("permission denied") {
+            return true
+        }
+        if probePermissionDenied(for: dbURL) {
+            return true
+        }
+        if dbURL.path.contains("group.com.apple.usernoted")
+            && (rc == SQLITE_CANTOPEN || rc == SQLITE_IOERR || lower.contains("unable to open")) {
+            return true
+        }
+        return false
+    }
+
     /// Reads new `com.electron.lark` records since `lastRecID` and returns emitted count.
     /// Cursor advances strictly up to the last record acknowledged by the daemon or in-process sink,
     /// so offline/restart windows never silently drop notifications.
@@ -83,12 +128,24 @@ public final class FeishuSensorRunner: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        if Self.probePermissionDenied(for: dbURL) {
+            let err = "Operation not permitted (Full Disk Access required)"
+            if !quietPermissionErrors {
+                fputs("""
+                [feishu-sensor] Unable to open \(dbURL.path): \(err)
+                Grant Full Disk Access to /Applications/Bianzhong.app in:
+                  System Settings -> Privacy & Security -> Full Disk Access
+                """, stderr)
+            }
+            throw FeishuSensorError.permissionDenied(err)
+        }
+
         var db: OpaquePointer?
         let rc = sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil)
         guard rc == SQLITE_OK, let handle = db else {
             let err = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "rc=\(rc)"
             sqlite3_close(db)
-            if rc == SQLITE_CANTOPEN || rc == SQLITE_PERM {
+            if rc == SQLITE_CANTOPEN || rc == SQLITE_PERM || Self.isSQLitePermissionError(rc: rc, message: err, dbURL: dbURL) {
                 if !quietPermissionErrors {
                     fputs("""
                     [feishu-sensor] Unable to open \(dbURL.path): \(err)
@@ -118,8 +175,19 @@ public final class FeishuSensorRunner: @unchecked Sendable {
         ORDER BY r.rec_id ASC;
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK else {
+        let prepRC = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
+        guard prepRC == SQLITE_OK else {
             let err = String(cString: sqlite3_errmsg(handle))
+            if Self.isSQLitePermissionError(rc: prepRC, message: err, dbURL: dbURL) {
+                if !quietPermissionErrors {
+                    fputs("""
+                    [feishu-sensor] Permission denied querying \(dbURL.path): \(err)
+                    Grant Full Disk Access to /Applications/Bianzhong.app in:
+                      System Settings -> Privacy & Security -> Full Disk Access
+                    """, stderr)
+                }
+                throw FeishuSensorError.permissionDenied(err)
+            }
             throw NSError(domain: "FeishuSensor", code: 2, userInfo: [NSLocalizedDescriptionKey: err])
         }
         defer { sqlite3_finalize(stmt) }
@@ -252,6 +320,7 @@ public final class FeishuSensorMonitor: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var running = false
     private var status: FeishuSensorStatus = .disabled
+    private var lastErrorMessage: String?
 
     public static func defaultUsernotedDBURL() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -284,6 +353,10 @@ public final class FeishuSensorMonitor: @unchecked Sendable {
 
     public func currentStatus() -> FeishuSensorStatus {
         lock.withLock { status }
+    }
+
+    public func currentErrorMessage() -> String? {
+        lock.withLock { lastErrorMessage }
     }
 
     public func start() {
@@ -346,20 +419,27 @@ public final class FeishuSensorMonitor: @unchecked Sendable {
         guard lock.withLock({ running }) else { return }
         do {
             _ = try runner.pollOnce(dryRun: false)
-            updateStatus(.watching)
+            updateStatus(.watching, errorMessage: nil)
             ensureFSEventStream()
-        } catch FeishuSensorError.permissionDenied {
+        } catch FeishuSensorError.permissionDenied(let msg) {
             if isLikelyMissingFDA() {
-                updateStatus(.needsFullDiskAccess)
+                updateStatus(.needsFullDiskAccess, errorMessage: msg)
             } else {
-                updateStatus(.unavailable)
+                updateStatus(.unavailable, errorMessage: msg)
             }
         } catch {
-            updateStatus(.unavailable)
+            if isLikelyMissingFDA() {
+                updateStatus(.needsFullDiskAccess, errorMessage: error.localizedDescription)
+            } else {
+                updateStatus(.unavailable, errorMessage: error.localizedDescription)
+            }
         }
     }
 
     private func isLikelyMissingFDA() -> Bool {
+        if FeishuSensorRunner.probePermissionDenied(for: dbURL) {
+            return true
+        }
         var st = stat()
         if Darwin.lstat(dbURL.path, &st) != 0 {
             if errno == EACCES || errno == EPERM {
@@ -417,12 +497,13 @@ public final class FeishuSensorMonitor: @unchecked Sendable {
         streamHolder.stream = newStream
     }
 
-    private func updateStatus(_ next: FeishuSensorStatus) {
+    private func updateStatus(_ next: FeishuSensorStatus, errorMessage: String? = nil) {
         let changed: Bool = lock.withLock {
             guard running else { return false }
-            if status == next { return false }
+            let same = (status == next && lastErrorMessage == errorMessage)
             status = next
-            return true
+            lastErrorMessage = errorMessage
+            return !same
         }
         if changed {
             onStatusChange(next)

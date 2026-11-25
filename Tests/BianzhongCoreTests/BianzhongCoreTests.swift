@@ -1222,4 +1222,450 @@ struct BianzhongCoreTests {
         #expect(updatedCfg.contains("feishu_sensor_enabled: false   # keep this comment"))
         #expect(AppConfig.load(from: cfgURL).feishuSensorEnabled == false)
     }
+
+    @Test("21. Per-field AND matching, cumulative window threshold, expect-window watchdog, rule toggle, and FDA detection")
+    func advancedRuleMatchingThresholdExpectAndFDA() async throws {
+        let shortID = String(UUID().uuidString.prefix(8))
+        let stateDir = URL(fileURLWithPath: "/tmp/bz-s21-\(shortID)", isDirectory: true)
+        let cfgDir = URL(fileURLWithPath: "/tmp/bz-c21-\(shortID)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: stateDir)
+            try? FileManager.default.removeItem(at: cfgDir)
+        }
+        let paths = BianzhongPaths(configDir: cfgDir, stateDir: stateDir)
+        try paths.ensureDirectories()
+
+        // (a) Per-field matching & AND logic: title == 群名 && body contains keywords
+        let andRuleMD = """
+        ---
+        id: feishu-group-and
+        enabled: true
+        description: 仅匹配支付研发群里同时含退款和报错的通知
+        match:
+          type: ["dev.bianzhong.feishu.notification"]
+          title_equals: ["支付研发群"]
+          body_all: ["退款"]
+          body_any: ["报错", "500"]
+          body_exclude: ["演练"]
+        funnel:
+          dedup_ttl: 60s
+          debounce: 0s
+          cooldown: 0s
+        execution:
+          driver: none
+        ---
+        ## Phase 1
+        noop
+        """
+        let andRule = ChimeRule.parse(markdown: andRuleMD, defaultID: "feishu-group-and")
+        #expect(andRule.titleEquals == ["支付研发群"])
+        #expect(andRule.bodyAll == ["退款"])
+        #expect(andRule.bodyAny == ["报错", "500"])
+        #expect(andRule.bodyExclude == ["演练"])
+
+        let store = try SQLiteStore(dbURL: paths.dbURL)
+        let funnel = WakeupFunnel(store: store, rules: [andRule])
+
+        // Wrong group title (even though body matches) -> dropped
+        let wrongGroup = EventEnvelope(
+            source: "bz://sensor/feishu",
+            type: "dev.bianzhong.feishu.notification",
+            correlationKey: "c1",
+            payload: ["title": "闲聊群", "body": "退款接口 500 报错"]
+        )
+        if case .dropped(let stage, _) = funnel.ingest(wrongGroup, onReady: { _, _ in }) {
+            #expect(stage == "dropped_rule")
+        } else {
+            Issue.record("Expected wrong group to be dropped")
+        }
+
+        // Right group, body missing required AND token "退款" -> dropped
+        let missingBodyAll = EventEnvelope(
+            source: "bz://sensor/feishu",
+            type: "dev.bianzhong.feishu.notification",
+            correlationKey: "c2",
+            payload: ["title": "支付研发群", "body": "登录接口 500"]
+        )
+        if case .dropped(let stage, _) = funnel.ingest(missingBodyAll, onReady: { _, _ in }) {
+            #expect(stage == "dropped_rule")
+        } else {
+            Issue.record("Expected missing body_all to be dropped")
+        }
+
+        // Right group, matches body_all + body_any, but hits body_exclude -> dropped
+        let excludedBody = EventEnvelope(
+            source: "bz://sensor/feishu",
+            type: "dev.bianzhong.feishu.notification",
+            correlationKey: "c3",
+            payload: ["title": "支付研发群", "body": "演练：退款接口 500"]
+        )
+        if case .dropped(let stage, _) = funnel.ingest(excludedBody, onReady: { _, _ in }) {
+            #expect(stage == "dropped_rule")
+        } else {
+            Issue.record("Expected body_exclude to drop event")
+        }
+
+        // Exact group + body_all + body_any -> ready!
+        let exactMatch = EventEnvelope(
+            source: "bz://sensor/feishu",
+            type: "dev.bianzhong.feishu.notification",
+            correlationKey: "c4",
+            payload: ["title": "支付研发群", "body": "退款接口 500"]
+        )
+        if case .ready(_, let matched) = funnel.ingest(exactMatch, onReady: { _, _ in }) {
+            #expect(matched.id == "feishu-group-and")
+        } else {
+            Issue.record("Expected exact title + body AND event to match")
+        }
+
+        // (b) Cumulative hit threshold: min_count: 2 + window: daily
+        let thresholdMD = """
+        ---
+        id: daily-twice-alert
+        enabled: true
+        match:
+          type: ["dev.bianzhong.feishu.notification"]
+          title_equals: ["值班群"]
+          body_any: ["超时"]
+        funnel:
+          dedup_ttl: 60s
+          debounce: 0s
+          cooldown: 0s
+          min_count: 2
+          window: daily
+          count_scope: rule
+          count_reset_on_trigger: true
+        execution:
+          driver: none
+        ---
+        ## Phase 1
+        noop
+        """
+        let thresholdRule = ChimeRule.parse(markdown: thresholdMD, defaultID: "daily-twice-alert")
+        #expect(thresholdRule.minCount == 2)
+        #expect(thresholdRule.countWindow == .daily)
+        funnel.updateRules([thresholdRule])
+
+        let cal = Calendar.current
+        let day1Morning = cal.date(from: DateComponents(year: 2026, month: 11, day: 25, hour: 10, minute: 0))!
+        let day1Afternoon = cal.date(from: DateComponents(year: 2026, month: 11, day: 25, hour: 15, minute: 0))!
+        let day2Morning = cal.date(from: DateComponents(year: 2026, month: 11, day: 26, hour: 9, minute: 0))!
+
+        let hit1 = EventEnvelope(source: "bz://sensor/feishu", type: "dev.bianzhong.feishu.notification", correlationKey: "g1", payload: ["title": "值班群", "body": "超时 #1"])
+        if case .dropped(let stage, let reason) = funnel.ingest(hit1, now: day1Morning, onReady: { _, _ in }) {
+            #expect(stage == "dropped_threshold")
+            #expect(reason == "threshold:1/2")
+        } else {
+            Issue.record("First hit should be held at 1/2")
+        }
+
+        let hit2 = EventEnvelope(source: "bz://sensor/feishu", type: "dev.bianzhong.feishu.notification", correlationKey: "g1", payload: ["title": "值班群", "body": "超时 #2"])
+        if case .ready(let enriched, let rule) = funnel.ingest(hit2, now: day1Afternoon, onReady: { _, _ in }) {
+            #expect(rule.id == "daily-twice-alert")
+            #expect(enriched.payload["window_hit_count"] == "2")
+        } else {
+            Issue.record("Second hit on same day should trigger")
+        }
+
+        // Next day resets count (and count_reset_on_trigger also cleared) -> first hit held again
+        let hit3 = EventEnvelope(source: "bz://sensor/feishu", type: "dev.bianzhong.feishu.notification", correlationKey: "g1", payload: ["title": "值班群", "body": "超时 #3"])
+        if case .dropped(let stage, let reason) = funnel.ingest(hit3, now: day2Morning, onReady: { _, _ in }) {
+            #expect(stage == "dropped_threshold")
+            #expect(reason == "threshold:1/2")
+        } else {
+            Issue.record("Next day first hit should be held at 1/2")
+        }
+
+        // (c) Expect-window watchdog: satisfied when signal arrives in window, fires once when missed
+        let expectMD = """
+        ---
+        id: daily-report-watchdog
+        enabled: true
+        description: 每天 09:00-09:30 预期收到数据日报
+        match:
+          type: ["dev.bianzhong.feishu.notification"]
+          title_equals: ["数据日报群"]
+          body_any: ["日报已产出"]
+        expect:
+          enabled: true
+          window: "09:00-09:30"
+          weekdays: ["mon", "tue", "wed", "thu", "fri"]
+          suppress_on_match: true
+        execution:
+          driver: none
+        on_complete:
+          - type: notify
+        ---
+        ## Phase 1
+        noop
+        """
+        let expectFile = paths.chimesDir.appendingPathComponent("daily-report-watchdog.md")
+        try expectMD.write(to: expectFile, atomically: true, encoding: .utf8)
+        let earlyMod = cal.date(from: DateComponents(year: 2026, month: 11, day: 24, hour: 12, minute: 0))!
+        try FileManager.default.setAttributes([.modificationDate: earlyMod], ofItemAtPath: expectFile.path)
+
+        let orch = try Orchestrator(paths: paths)
+        let loadedExpect = orch.allRules().first(where: { $0.id == "daily-report-watchdog" })
+        #expect(loadedExpect?.expectWindow?.windowStart == "09:00")
+        #expect(loadedExpect?.expectWindow?.windowEnd == "09:30")
+        #expect(loadedExpect?.expectWindow?.weekdays == [1, 2, 3, 4, 5])
+
+        // Wednesday 2026-11-25 09:15: signal arrives on time -> satisfied, no alert after 09:35
+        let wed0915 = cal.date(from: DateComponents(year: 2026, month: 11, day: 25, hour: 9, minute: 15))!
+        let wed0935 = cal.date(from: DateComponents(year: 2026, month: 11, day: 25, hour: 9, minute: 35))!
+        let reportMsg = EventEnvelope(source: "bz://sensor/feishu", type: "dev.bianzhong.feishu.notification", correlationKey: "r1", payload: ["title": "数据日报群", "body": "今日日报已产出"])
+        let disp = orch.funnel.ingest(reportMsg, now: wed0915, onReady: { _, _ in })
+        if case .dropped(let stage, _) = disp {
+            #expect(stage == "expect_satisfied")
+        } else {
+            Issue.record("Expected signal within expect window to record expect_satisfied")
+        }
+        let missedOnWed = orch.checkExpectWindows(now: wed0935, calendar: cal)
+        #expect(missedOnWed.isEmpty)
+
+        // Thursday 2026-11-26 09:35: no signal arrived -> fires once!
+        let thu0935 = cal.date(from: DateComponents(year: 2026, month: 11, day: 26, hour: 9, minute: 35))!
+        let missedOnThu1 = orch.checkExpectWindows(now: thu0935, calendar: cal)
+        #expect(missedOnThu1.count == 1)
+        #expect(missedOnThu1.first?.type == "dev.bianzhong.expect.missed")
+        // Second check on same Thursday must not double-fire
+        let missedOnThu2 = orch.checkExpectWindows(now: thu0935, calendar: cal)
+        #expect(missedOnThu2.isEmpty)
+
+        // Saturday 2026-11-28 09:35: not in weekdays [1..5] -> does not fire
+        let sat0935 = cal.date(from: DateComponents(year: 2026, month: 11, day: 28, hour: 9, minute: 35))!
+        #expect(orch.checkExpectWindows(now: sat0935, calendar: cal).isEmpty)
+
+        // (d) Rule toggle on disk via Orchestrator.setRuleEnabled preserves file & updates state
+        try orch.setRuleEnabled(id: "daily-report-watchdog", enabled: false)
+        #expect(orch.allRules().first(where: { $0.id == "daily-report-watchdog" })?.enabled == false)
+        try orch.setRuleEnabled(id: "daily-report-watchdog", enabled: true)
+        #expect(orch.allRules().first(where: { $0.id == "daily-report-watchdog" })?.enabled == true)
+
+        // (e) FeishuSensorMonitor reports .needsFullDiskAccess (not .unavailable) on unreadable file (chmod 000)
+        let lockedDB = stateDir.appendingPathComponent("locked-usernoted.db")
+        try Data("sqlite-locked".utf8).write(to: lockedDB)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: lockedDB.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: lockedDB.path) }
+
+        #expect(FeishuSensorRunner.probePermissionDenied(for: lockedDB) == true)
+        let monitor = FeishuSensorMonitor(
+            dbURL: lockedDB,
+            cursorURL: stateDir.appendingPathComponent("fda-cursor.txt"),
+            skipExistingOnFirstRun: true,
+            eventSink: { _ in true }
+        )
+        monitor.start()
+        defer { monitor.stop() }
+        for _ in 0..<40 {
+            if monitor.currentStatus() == .needsFullDiskAccess { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        #expect(monitor.currentStatus() == .needsFullDiskAccess)
+    }
+
+    @Test("22. Review regressions: block-sequence YAML, CRLF, late-init expect guard, pause satisfaction, replay timestamps, atomic threshold, and targeted test")
+    func reviewRegressionsBlockYAMLWatchdogPauseReplayAndConcurrency() async throws {
+        let shortID = String(UUID().uuidString.prefix(8))
+        let stateDir = URL(fileURLWithPath: "/tmp/bz-s22-\(shortID)", isDirectory: true)
+        let cfgDir = URL(fileURLWithPath: "/tmp/bz-c22-\(shortID)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: stateDir)
+            try? FileManager.default.removeItem(at: cfgDir)
+        }
+        let paths = BianzhongPaths(configDir: cfgDir, stateDir: stateDir)
+        try paths.ensureDirectories()
+
+        // (a) Multi-line YAML block lists (- item), CRLF line endings, and expect.enabled = false preservation
+        let crlfBlockMD = [
+            "---",
+            "id: block-list-rule",
+            "enabled: true   # inline comment",
+            "match:",
+            "  title_equals:",
+            "    - 支付研发群",
+            "    - 核心告警群",
+            "  body:",
+            "    any:",
+            "      - 报错",
+            "      - 500",
+            "expect:",
+            "  enabled: false",
+            "  window: 09:00-09:30",
+            "  weekdays:",
+            "    - mon",
+            "    - fri",
+            "---",
+            "## Phase 1",
+            "check"
+        ].joined(separator: "\r\n")
+
+        let crlfURL = paths.chimesDir.appendingPathComponent("block-list-rule.md")
+        try crlfBlockMD.write(to: crlfURL, atomically: true, encoding: .utf8)
+        let parsedBlock = ChimeRule.parse(markdown: crlfBlockMD, defaultID: "block-list-rule")
+        #expect(parsedBlock.titleEquals == ["支付研发群", "核心告警群"])
+        #expect(parsedBlock.bodyAny == ["报错", "500"])
+        #expect(parsedBlock.expectWindow?.enabled == false)
+        #expect(parsedBlock.expectWindow?.weekdays == [1, 5])
+
+        try ChimeRule.setEnabled(false, in: crlfURL)
+        let toggledText = try String(contentsOf: crlfURL, encoding: .utf8)
+        #expect(!toggledText.contains("\n\n\n"))
+        #expect(toggledText.contains("enabled: false   # inline comment"))
+        try? FileManager.default.removeItem(at: crlfURL)
+
+        // (b) Late-created expect rule after today's deadline must NOT retroactively misfire today,
+        //     and paused daemon still records satisfaction for active expect windows
+        let cal = Calendar.current
+        let expectFile = paths.chimesDir.appendingPathComponent("morning-check.md")
+        let expectMD = """
+        ---
+        id: morning-check
+        enabled: true
+        match:
+          type: ["dev.bianzhong.feishu.notification"]
+          title_equals: ["晨会群"]
+          body_any: ["签到"]
+        expect:
+          enabled: true
+          window: "09:00-09:30"
+          suppress_on_match: true
+        execution:
+          driver: none
+        on_complete:
+          - type: notify
+        ---
+        ## Phase 1
+        noop
+        """
+        try expectMD.write(to: expectFile, atomically: true, encoding: .utf8)
+        let lateModDate = cal.date(from: DateComponents(year: 2026, month: 11, day: 25, hour: 17, minute: 0))!
+        try FileManager.default.setAttributes([.modificationDate: lateModDate], ofItemAtPath: expectFile.path)
+
+        let orch = try Orchestrator(paths: paths)
+        // Checking at 17:05 on same day when rule was created at 17:00 (> 09:30 deadline) -> must NOT misfire
+        let day1Late = cal.date(from: DateComponents(year: 2026, month: 11, day: 25, hour: 17, minute: 5))!
+        #expect(orch.checkExpectWindows(now: day1Late, calendar: cal).isEmpty)
+
+        // Next day (2026-11-26): pause daemon, emit matching event inside window -> still satisfies expect window!
+        // Set mtime before day2 deadline (already 2026-11-25 17:00 <= 2026-11-26 09:30)
+        orch.pause(forSeconds: 3600)
+        let day2InWindow = cal.date(from: DateComponents(year: 2026, month: 11, day: 26, hour: 9, minute: 10))!
+        let checkinEv = EventEnvelope(
+            source: "bz://sensor/feishu",
+            type: "dev.bianzhong.feishu.notification",
+            correlationKey: "m1",
+            payload: ["title": "晨会群", "body": "已完成签到"]
+        )
+        let satisfiedWhilePaused = orch.funnel.recordExpectWindowMatchesWhilePaused(checkinEv, now: day2InWindow)
+        #expect(satisfiedWhilePaused == ["morning-check"])
+        orch.resume()
+
+        let day2AfterWindow = cal.date(from: DateComponents(year: 2026, month: 11, day: 26, hour: 9, minute: 40))!
+        #expect(orch.checkExpectWindows(now: day2AfterWindow, calendar: cal).isEmpty)
+
+        // Day 3 (2026-11-27): no signal -> fires properly!
+        let day3AfterWindow = cal.date(from: DateComponents(year: 2026, month: 11, day: 27, hour: 9, minute: 40))!
+        #expect(orch.checkExpectWindows(now: day3AfterWindow, calendar: cal).count == 1)
+
+        // (c) RuleSimulator respects historical `event.ts` across separate days for `window: daily`
+        let dailyRule = ChimeRule(
+            id: "sim-daily-2",
+            matchTypes: ["dev.bianzhong.feishu.notification"],
+            keywordsAny: ["告警"],
+            dedupTTLSeconds: 0,
+            debounceSeconds: 0,
+            cooldownSeconds: 0,
+            minCount: 2,
+            countWindow: .daily,
+            driver: "none"
+        )
+        let evDayA = EventEnvelope(
+            source: "bz://sensor/feishu",
+            type: "dev.bianzhong.feishu.notification",
+            ts: "2026-11-20T08:00:00Z",
+            correlationKey: "k1",
+            payload: ["title": "群A", "body": "告警 1"]
+        )
+        let evDayB = EventEnvelope(
+            source: "bz://sensor/feishu",
+            type: "dev.bianzhong.feishu.notification",
+            ts: "2026-11-21T08:00:00Z",
+            correlationKey: "k1",
+            payload: ["title": "群A", "body": "告警 2"]
+        )
+        let simAcrossDays = await RuleSimulator.simulate(events: [evDayA, evDayB], rules: [dailyRule], config: AppConfig())
+        #expect(simAcrossDays.directActionOnly == 0)
+        #expect(simAcrossDays.droppedL0 == 2)
+
+        let evSameDayB = EventEnvelope(
+            source: "bz://sensor/feishu",
+            type: "dev.bianzhong.feishu.notification",
+            ts: "2026-11-20T09:00:00Z",
+            correlationKey: "k1",
+            payload: ["title": "群A", "body": "告警 3"]
+        )
+        let simSameDay = await RuleSimulator.simulate(events: [evDayA, evSameDayB], rules: [dailyRule], config: AppConfig())
+        #expect(simSameDay.directActionOnly == 1)
+
+        // (d) Atomic concurrent threshold counter: 6 concurrent hits with minCount=3 + resetOnTrigger=true -> exactly 2 triggers
+        let store = orch.store
+        let triggerCount = await withTaskGroup(of: Bool.self) { group -> Int in
+            for i in 0..<6 {
+                group.addTask {
+                    let res = try? store.recordRuleHitAndCheckThreshold(
+                        chimeID: "concurrent-rule",
+                        scopeKey: "__rule__",
+                        eventID: "ev-\(i)",
+                        windowStartMs: 0,
+                        minCount: 3,
+                        resetOnTrigger: true,
+                        nowMs: 1_000_000 + Int64(i)
+                    )
+                    return res?.triggered == true
+                }
+            }
+            var total = 0
+            for await fired in group where fired {
+                total += 1
+            }
+            return total
+        }
+        #expect(triggerCount == 2)
+
+        // (e) Targeted `triggerRuleTest` invokes the requested rule even when an earlier catch-all rule exists
+        let catchAllFile = paths.chimesDir.appendingPathComponent("00-catch-all.md")
+        try """
+        ---
+        id: 00-catch-all
+        enabled: true
+        match:
+          type: ["*"]
+        execution:
+          driver: none
+        on_complete: []
+        ---
+        """.write(to: catchAllFile, atomically: true, encoding: .utf8)
+
+        let specificFile = paths.chimesDir.appendingPathComponent("99-specific.md")
+        try """
+        ---
+        id: 99-specific
+        enabled: true
+        match:
+          type: ["dev.bianzhong.feishu.notification"]
+          title_equals: ["专属群"]
+        execution:
+          driver: none
+        on_complete: []
+        ---
+        """.write(to: specificFile, atomically: true, encoding: .utf8)
+        orch.reloadConfig()
+
+        let badTarget = EventEnvelope(source: "bz://test", type: "dev.bianzhong.feishu.notification", correlationKey: "t", payload: ["title": "其他群"])
+        #expect(orch.triggerRuleTest(ruleID: "99-specific", event: badTarget).ok == false)
+
+        let goodTarget = EventEnvelope(source: "bz://test", type: "dev.bianzhong.feishu.notification", correlationKey: "t", payload: ["title": "专属群"])
+        #expect(orch.triggerRuleTest(ruleID: "99-specific", event: goodTarget).ok == true)
+    }
 }

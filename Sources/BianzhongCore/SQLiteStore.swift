@@ -192,6 +192,24 @@ public final class SQLiteStore: @unchecked Sendable {
             resolved_at              INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_approvals_inbox ON approvals(status, kind, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS rule_hit_counters (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            chime_id    TEXT NOT NULL,
+            scope_key   TEXT NOT NULL,
+            event_id    TEXT NOT NULL,
+            hit_at      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rule_hit_counters_lookup ON rule_hit_counters(chime_id, scope_key, hit_at DESC);
+
+        CREATE TABLE IF NOT EXISTS expect_windows (
+            chime_id         TEXT NOT NULL,
+            period_key       TEXT NOT NULL,
+            status           TEXT NOT NULL CHECK (status IN ('satisfied', 'missed_triggered')),
+            matched_event_id TEXT,
+            updated_at       INTEGER NOT NULL,
+            PRIMARY KEY (chime_id, period_key)
+        );
         """
         try execute(ddl)
     }
@@ -263,7 +281,7 @@ public final class SQLiteStore: @unchecked Sendable {
         let sql = """
         SELECT COUNT(*) FROM events
         WHERE matched_chime_id = ? AND dedup_key = ? AND received_at >= ?
-          AND funnel_stage IN ('dispatched', 'coalesced', 'l1_digest', 'l1_notified');
+          AND funnel_stage IN ('dispatched', 'coalesced', 'dropped_threshold', 'l1_digest', 'l1_notified');
         """
         let count = try queryScalarInt(sql) { stmt in
             self.bindText(stmt, 1, chimeID)
@@ -271,6 +289,177 @@ public final class SQLiteStore: @unchecked Sendable {
             sqlite3_bind_int64(stmt, 3, cutoff)
         }
         return count > 0
+    }
+
+    /// Atomically prunes expired hits, records the new hit, counts active window hits,
+    /// and optionally resets the counter when `minCount` is reached — all under a single lock & SQLite transaction.
+    public func recordRuleHitAndCheckThreshold(
+        chimeID: String,
+        scopeKey: String,
+        eventID: String,
+        windowStartMs: Int64,
+        minCount: Int,
+        resetOnTrigger: Bool,
+        nowMs: Int64? = nil
+    ) throws -> (count: Int, triggered: Bool) {
+        let now = nowMs ?? Self.nowMs()
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { throw SQLiteStoreError.openFailed("Database closed") }
+
+        func execUnlocked(_ sql: String) throws {
+            var errMsg: UnsafeMutablePointer<CChar>?
+            let rc = sqlite3_exec(db, sql, nil, nil, &errMsg)
+            if rc != SQLITE_OK {
+                let msg = errMsg.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(db))
+                sqlite3_free(errMsg)
+                throw SQLiteStoreError.stepFailed(msg)
+            }
+        }
+
+        try execUnlocked("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            var delStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "DELETE FROM rule_hit_counters WHERE chime_id = ? AND scope_key = ? AND hit_at < ?;", -1, &delStmt, nil) == SQLITE_OK else {
+                throw SQLiteStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            bindText(delStmt, 1, chimeID)
+            bindText(delStmt, 2, scopeKey)
+            sqlite3_bind_int64(delStmt, 3, windowStartMs)
+            let delRC = sqlite3_step(delStmt)
+            sqlite3_finalize(delStmt)
+            guard delRC == SQLITE_DONE else {
+                throw SQLiteStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+            }
+
+            var insStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "INSERT INTO rule_hit_counters (chime_id, scope_key, event_id, hit_at) VALUES (?, ?, ?, ?);", -1, &insStmt, nil) == SQLITE_OK else {
+                throw SQLiteStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            bindText(insStmt, 1, chimeID)
+            bindText(insStmt, 2, scopeKey)
+            bindText(insStmt, 3, eventID)
+            sqlite3_bind_int64(insStmt, 4, now)
+            let insRC = sqlite3_step(insStmt)
+            sqlite3_finalize(insStmt)
+            guard insRC == SQLITE_DONE else {
+                throw SQLiteStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+            }
+
+            var cntStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM rule_hit_counters WHERE chime_id = ? AND scope_key = ? AND hit_at >= ?;", -1, &cntStmt, nil) == SQLITE_OK else {
+                throw SQLiteStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            bindText(cntStmt, 1, chimeID)
+            bindText(cntStmt, 2, scopeKey)
+            sqlite3_bind_int64(cntStmt, 3, windowStartMs)
+            let count = sqlite3_step(cntStmt) == SQLITE_ROW ? Int(sqlite3_column_int64(cntStmt, 0)) : 0
+            sqlite3_finalize(cntStmt)
+
+            let triggered = count >= max(1, minCount)
+            if triggered && resetOnTrigger {
+                var clrStmt: OpaquePointer?
+                guard sqlite3_prepare_v2(db, "DELETE FROM rule_hit_counters WHERE chime_id = ? AND scope_key = ?;", -1, &clrStmt, nil) == SQLITE_OK else {
+                    throw SQLiteStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+                }
+                bindText(clrStmt, 1, chimeID)
+                bindText(clrStmt, 2, scopeKey)
+                let clrRC = sqlite3_step(clrStmt)
+                sqlite3_finalize(clrStmt)
+                guard clrRC == SQLITE_DONE else {
+                    throw SQLiteStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+                }
+            }
+
+            try execUnlocked("COMMIT;")
+            return (count, triggered)
+        } catch {
+            try? execUnlocked("ROLLBACK;")
+            throw error
+        }
+    }
+
+    @discardableResult
+    public func recordRuleHit(
+        chimeID: String,
+        scopeKey: String,
+        eventID: String,
+        windowStartMs: Int64,
+        nowMs: Int64? = nil
+    ) throws -> Int {
+        let now = nowMs ?? Self.nowMs()
+        try runStatement("DELETE FROM rule_hit_counters WHERE chime_id = ? AND scope_key = ? AND hit_at < ?;") { stmt in
+            self.bindText(stmt, 1, chimeID)
+            self.bindText(stmt, 2, scopeKey)
+            sqlite3_bind_int64(stmt, 3, windowStartMs)
+        }
+        try runStatement("INSERT INTO rule_hit_counters (chime_id, scope_key, event_id, hit_at) VALUES (?, ?, ?, ?);") { stmt in
+            self.bindText(stmt, 1, chimeID)
+            self.bindText(stmt, 2, scopeKey)
+            self.bindText(stmt, 3, eventID)
+            sqlite3_bind_int64(stmt, 4, now)
+        }
+        return try countRuleHits(chimeID: chimeID, scopeKey: scopeKey, windowStartMs: windowStartMs)
+    }
+
+    public func countRuleHits(chimeID: String, scopeKey: String, windowStartMs: Int64) throws -> Int {
+        let sql = "SELECT COUNT(*) FROM rule_hit_counters WHERE chime_id = ? AND scope_key = ? AND hit_at >= ?;"
+        return try queryScalarInt(sql) { stmt in
+            self.bindText(stmt, 1, chimeID)
+            self.bindText(stmt, 2, scopeKey)
+            sqlite3_bind_int64(stmt, 3, windowStartMs)
+        }
+    }
+
+    public func clearRuleHits(chimeID: String, scopeKey: String) throws {
+        try runStatement("DELETE FROM rule_hit_counters WHERE chime_id = ? AND scope_key = ?;") { stmt in
+            self.bindText(stmt, 1, chimeID)
+            self.bindText(stmt, 2, scopeKey)
+        }
+    }
+
+    public func markExpectWindow(
+        chimeID: String,
+        periodKey: String,
+        status: String,
+        matchedEventID: String? = nil,
+        nowMs: Int64? = nil
+    ) throws {
+        let now = nowMs ?? Self.nowMs()
+        let sql = """
+        INSERT INTO expect_windows (chime_id, period_key, status, matched_event_id, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(chime_id, period_key) DO UPDATE SET
+            status = excluded.status,
+            matched_event_id = COALESCE(excluded.matched_event_id, expect_windows.matched_event_id),
+            updated_at = excluded.updated_at;
+        """
+        try runStatement(sql) { stmt in
+            self.bindText(stmt, 1, chimeID)
+            self.bindText(stmt, 2, periodKey)
+            self.bindText(stmt, 3, status)
+            self.bindOptionalText(stmt, 4, matchedEventID)
+            sqlite3_bind_int64(stmt, 5, now)
+        }
+    }
+
+    public func expectWindowStatus(chimeID: String, periodKey: String) throws -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { throw SQLiteStoreError.openFailed("Database closed") }
+
+        let sql = "SELECT status FROM expect_windows WHERE chime_id = ? AND period_key = ? LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw SQLiteStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, chimeID)
+        bindText(stmt, 2, periodKey)
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return columnText(stmt, 0)
+        }
+        return nil
     }
 
     public func upsertSession(
@@ -673,6 +862,63 @@ public final class SQLiteStore: @unchecked Sendable {
         return events.reversed()
     }
 
+    /// Returns events received within `[startMs, endMs]` (ascending), excluding synthetic watchdog alerts.
+    public func listEventsReceivedBetween(startMs: Int64, endMs: Int64, limit: Int = 500) throws -> [EventEnvelope] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { throw SQLiteStoreError.openFailed("Database closed") }
+
+        let sql = """
+        SELECT id, source, type, ts, correlation_key, dedup_key, privacy_level,
+               causality_depth, parent_run_id, payload_summary, ambient_json
+        FROM events
+        WHERE received_at >= ? AND received_at <= ? AND type != 'dev.bianzhong.expect.missed'
+        ORDER BY received_at ASC LIMIT ?;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw SQLiteStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, startMs)
+        sqlite3_bind_int64(stmt, 2, endMs)
+        sqlite3_bind_int(stmt, 3, Int32(limit))
+
+        var events: [EventEnvelope] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = columnText(stmt, 0) ?? ""
+            let source = columnText(stmt, 1) ?? ""
+            let type = columnText(stmt, 2) ?? ""
+            let ts = columnText(stmt, 3) ?? ""
+            let corr = columnText(stmt, 4) ?? ""
+            let dedup = columnText(stmt, 5) ?? ""
+            let privacy = PrivacyLevel(rawValue: columnText(stmt, 6) ?? "internal") ?? .internal
+            let depth = Int(sqlite3_column_int(stmt, 7))
+            let parentRunID = columnText(stmt, 8)
+            let payloadText = columnText(stmt, 9) ?? "{}"
+            let ambientText = columnText(stmt, 10) ?? "{}"
+
+            let payload = (try? JSONDecoder().decode([String: String].self, from: Data(payloadText.utf8))) ?? [:]
+            let ambient = (try? JSONDecoder().decode(AmbientContext.self, from: Data(ambientText.utf8))) ?? AmbientContext()
+
+            events.append(
+                EventEnvelope(
+                    id: id,
+                    source: source,
+                    type: type,
+                    ts: ts,
+                    correlationKey: corr,
+                    dedupKey: dedup,
+                    privacyLevel: privacy,
+                    causality: Causality(emitterPID: 0, parentRunID: parentRunID, depth: depth),
+                    payload: payload,
+                    ambientContext: ambient
+                )
+            )
+        }
+        return events
+    }
+
     public func recentTimeline(withinSeconds: Int = 1200, excludingEventID: String, limit: Int = 10) throws -> [TimelineEntry] {
         lock.lock()
         defer { lock.unlock() }
@@ -886,6 +1132,12 @@ public final class SQLiteStore: @unchecked Sendable {
         }
         let before = try queryScalarInt("SELECT COUNT(*) FROM events;")
         try runStatement("DELETE FROM events WHERE received_at < ? AND id NOT IN (SELECT event_id FROM runs) AND id NOT IN (SELECT event_id FROM approvals);") { stmt in
+            sqlite3_bind_int64(stmt, 1, olderThanMs)
+        }
+        try runStatement("DELETE FROM rule_hit_counters WHERE hit_at < ?;") { stmt in
+            sqlite3_bind_int64(stmt, 1, olderThanMs)
+        }
+        try runStatement("DELETE FROM expect_windows WHERE updated_at < ?;") { stmt in
             sqlite3_bind_int64(stmt, 1, olderThanMs)
         }
         let after = try queryScalarInt("SELECT COUNT(*) FROM events;")

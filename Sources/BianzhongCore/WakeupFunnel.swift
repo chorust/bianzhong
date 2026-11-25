@@ -19,8 +19,104 @@ private struct WriteLease {
     var expiry: Date
 }
 
+/// Evaluates expected signal time windows (`expect:`) for missed-signal watchdogs.
+public enum ExpectWindowEvaluator {
+    public struct ResolvedWindow: Sendable, Equatable {
+        public let periodKey: String
+        public let start: Date
+        public let end: Date
+        public let deadline: Date
+    }
+
+    public static func parseClock(_ hhmm: String) -> (hour: Int, minute: Int)? {
+        let parts = hhmm.trimmingCharacters(in: .whitespaces).split(separator: ":")
+        guard parts.count == 2,
+              let h = Int(parts[0]), (0...23).contains(h),
+              let m = Int(parts[1]), (0...59).contains(m) else {
+            return nil
+        }
+        return (h, m)
+    }
+
+    public static func isoWeekday(for date: Date, calendar: Calendar = .current) -> Int {
+        let wd = calendar.component(.weekday, from: date) // 1 = Sun, 2 = Mon ... 7 = Sat
+        return wd == 1 ? 7 : wd - 1
+    }
+
+    public static func periodKey(for date: Date, calendar: Calendar = .current) -> String {
+        let comps = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", comps.year ?? 0, comps.month ?? 0, comps.day ?? 0)
+    }
+
+    /// Resolves the active window anchored to `baseDay` (handles overnight windows where `end <= start`).
+    public static func windowForDay(_ baseDay: Date, spec: ExpectWindowSpec, calendar: Calendar = .current) -> ResolvedWindow? {
+        guard spec.enabled,
+              let startClock = parseClock(spec.windowStart),
+              let endClock = parseClock(spec.windowEnd) else {
+            return nil
+        }
+        if !spec.weekdays.isEmpty {
+            let wd = isoWeekday(for: baseDay, calendar: calendar)
+            if !spec.weekdays.contains(wd) {
+                return nil
+            }
+        }
+        let dayStart = calendar.startOfDay(for: baseDay)
+        guard let start = calendar.date(bySettingHour: startClock.hour, minute: startClock.minute, second: 0, of: dayStart),
+              var end = calendar.date(bySettingHour: endClock.hour, minute: endClock.minute, second: 0, of: dayStart) else {
+            return nil
+        }
+        if end <= start {
+            end = calendar.date(byAdding: .day, value: 1, to: end) ?? end.addingTimeInterval(86400)
+        }
+        let deadline = end.addingTimeInterval(TimeInterval(spec.graceSeconds))
+        return ResolvedWindow(
+            periodKey: periodKey(for: dayStart, calendar: calendar),
+            start: start,
+            end: end,
+            deadline: deadline
+        )
+    }
+
+    /// Returns the `periodKey` if `now` falls inside an active expectation window `[start, deadline]`.
+    public static func activePeriodKey(for spec: ExpectWindowSpec, at now: Date, calendar: Calendar = .current) -> String? {
+        let today = calendar.startOfDay(for: now)
+        if let w = windowForDay(today, spec: spec, calendar: calendar), now >= w.start && now <= w.deadline {
+            return w.periodKey
+        }
+        // Check yesterday for overnight windows (e.g. 23:30–00:30)
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: today),
+           let w = windowForDay(yesterday, spec: spec, calendar: calendar),
+           now >= w.start && now <= w.deadline {
+            return w.periodKey
+        }
+        return nil
+    }
+
+    /// Returns the most recent overdue `ResolvedWindow` if `now > deadline` for today (or an overnight window that ended today).
+    public static func missedWindow(for spec: ExpectWindowSpec, at now: Date, calendar: Calendar = .current) -> ResolvedWindow? {
+        let today = calendar.startOfDay(for: now)
+        if let w = windowForDay(today, spec: spec, calendar: calendar), now > w.deadline {
+            return w
+        }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: today),
+           let w = windowForDay(yesterday, spec: spec, calendar: calendar),
+           calendar.isDate(w.deadline, inSameDayAs: today),
+           now > w.deadline {
+            return w
+        }
+        return nil
+    }
+
+    /// Returns the most recent overdue window's `periodKey` if `now > deadline` for today (or an overnight window that ended today).
+    public static func missedPeriodKey(for spec: ExpectWindowSpec, at now: Date, calendar: Calendar = .current) -> String? {
+        missedWindow(for: spec, at: now, calendar: calendar)?.periodKey
+    }
+}
+
 /// Deterministic L0 wakeup funnel implementing privacy ACL, 4-layer loop guard,
-/// rule matching, TTL dedup, trailing debounce coalescing, and cooldown locks.
+/// per-field & AND rule matching, TTL dedup, cumulative window thresholds,
+/// expect-window satisfaction, trailing debounce coalescing, and cooldown locks.
 public final class WakeupFunnel: @unchecked Sendable {
     private let store: SQLiteStore
     private let lock = NSLock()
@@ -133,6 +229,7 @@ public final class WakeupFunnel: @unchecked Sendable {
     @discardableResult
     public func ingest(
         _ event: EventEnvelope,
+        now: Date = Date(),
         onReady: @escaping @Sendable (EventEnvelope, ChimeRule) -> Void
     ) -> FunnelDisposition {
         // L0.1: Restricted privacy hard gate (never write to SQLite or models)
@@ -146,8 +243,17 @@ public final class WakeupFunnel: @unchecked Sendable {
             return .dropped(stage: "dropped_loop", reason: loopReason)
         }
 
-        // L0.3: Deterministic rule match
+        // L0.2b: Record satisfaction for any active expect-window watchdog rules whose match criteria pass
+        let satisfiedExpectIDs = recordExpectWindowMatchesIfNeeded(for: event, now: now)
+
+        // L0.3: Deterministic rule match (skips suppressOnMatch expect-only watchdogs)
         guard let matchedRule = matchFirstRule(for: event) else {
+            if !satisfiedExpectIDs.isEmpty {
+                let firstID = satisfiedExpectIDs[0]
+                let reason = "window_satisfied:\(satisfiedExpectIDs.joined(separator: ","))"
+                try? store.recordEvent(event, funnelStage: "expect_satisfied", matchedChimeID: firstID, dropReason: reason)
+                return .dropped(stage: "expect_satisfied", reason: reason)
+            }
             try? store.recordEvent(event, funnelStage: "dropped_rule", dropReason: "no_chime_matched")
             return .dropped(stage: "dropped_rule", reason: "no_chime_matched")
         }
@@ -165,16 +271,77 @@ public final class WakeupFunnel: @unchecked Sendable {
             return .dropped(stage: "dropped_cooldown", reason: "cooldown_active")
         }
 
-        // L0.5: Trailing debounce & time-window coalescing
-        if matchedRule.debounceSeconds <= 0 {
-            markDispatched(event, rule: matchedRule, corrKey: corrKey)
-            onReady(event, matchedRule)
-            return .ready(event: event, rule: matchedRule)
+        // L0.4b: Atomic cumulative hit threshold within time window (e.g. min_count: 2 + window: daily)
+        var effectiveEvent = event
+        if matchedRule.minCount > 1 {
+            let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+            let windowStartMs = computeWindowStartMs(for: matchedRule.countWindow, now: now)
+            let scopeKey = matchedRule.countScope == .correlation ? event.correlationKey : "__rule__"
+            let outcome = (try? store.recordRuleHitAndCheckThreshold(
+                chimeID: matchedRule.id,
+                scopeKey: scopeKey,
+                eventID: event.id,
+                windowStartMs: windowStartMs,
+                minCount: matchedRule.minCount,
+                resetOnTrigger: matchedRule.countResetOnTrigger,
+                nowMs: nowMs
+            )) ?? (count: 1, triggered: matchedRule.minCount <= 1)
+            if !outcome.triggered {
+                let reason = "threshold:\(outcome.count)/\(matchedRule.minCount)"
+                try? store.recordEvent(event, funnelStage: "dropped_threshold", matchedChimeID: matchedRule.id, dropReason: reason)
+                return .dropped(stage: "dropped_threshold", reason: reason)
+            }
+            effectiveEvent.payload["window_hit_count"] = "\(outcome.count)"
         }
 
-        enqueueDebounce(event, rule: matchedRule, bucketKey: corrKey, onReady: onReady)
-        try? store.recordEvent(event, funnelStage: "coalesced", matchedChimeID: matchedRule.id)
-        return .coalescing(chimeID: matchedRule.id, correlationKey: event.correlationKey)
+        // L0.5: Trailing debounce & time-window coalescing
+        if matchedRule.debounceSeconds <= 0 {
+            markDispatched(effectiveEvent, rule: matchedRule, corrKey: corrKey)
+            onReady(effectiveEvent, matchedRule)
+            return .ready(event: effectiveEvent, rule: matchedRule)
+        }
+
+        enqueueDebounce(effectiveEvent, rule: matchedRule, bucketKey: corrKey, onReady: onReady)
+        try? store.recordEvent(effectiveEvent, funnelStage: "coalesced", matchedChimeID: matchedRule.id)
+        return .coalescing(chimeID: matchedRule.id, correlationKey: effectiveEvent.correlationKey)
+    }
+
+    private func computeWindowStartMs(for window: CountWindow, now: Date) -> Int64 {
+        switch window {
+        case .daily:
+            return Int64(Calendar.current.startOfDay(for: now).timeIntervalSince1970 * 1000)
+        case .sliding(let seconds):
+            return Int64((now.timeIntervalSince1970 - Double(seconds)) * 1000)
+        }
+    }
+
+    /// Records satisfaction for active `expect` windows safely even while daemon dispatch is paused.
+    @discardableResult
+    public func recordExpectWindowMatchesWhilePaused(_ event: EventEnvelope, now: Date = Date()) -> [String] {
+        guard event.privacyLevel != .restricted else { return [] }
+        guard checkLoopViolation(event) == nil else { return [] }
+        return recordExpectWindowMatchesIfNeeded(for: event, now: now)
+    }
+
+    private func recordExpectWindowMatchesIfNeeded(for event: EventEnvelope, now: Date) -> [String] {
+        let snapshot = currentRules()
+        var satisfied: [String] = []
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        for rule in snapshot where rule.enabled {
+            guard let spec = rule.expectWindow, spec.enabled else { continue }
+            guard matchesRule(event, rule: rule) else { continue }
+            if let periodKey = ExpectWindowEvaluator.activePeriodKey(for: spec, at: now) {
+                try? store.markExpectWindow(
+                    chimeID: rule.id,
+                    periodKey: periodKey,
+                    status: "satisfied",
+                    matchedEventID: event.id,
+                    nowMs: nowMs
+                )
+                satisfied.append(rule.id)
+            }
+        }
+        return satisfied
     }
 
     private func checkLoopViolation(_ event: EventEnvelope) -> String? {
@@ -212,24 +379,93 @@ public final class WakeupFunnel: @unchecked Sendable {
         return nil
     }
 
+    public func matchesRule(_ event: EventEnvelope, rule: ChimeRule) -> Bool {
+        let haystack = event.searchableText.lowercased()
+        let title = (event.payload["title"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let subtitle = (event.payload["subtitle"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let body = (event.payload["body"] ?? event.payload["summary"] ?? "").lowercased()
+
+        if !rule.matchTypes.isEmpty && !rule.matchTypes.contains(where: { wildcardMatch(pattern: $0, value: event.type) }) {
+            return false
+        }
+        if !rule.matchSources.isEmpty && !rule.matchSources.contains(where: { wildcardMatch(pattern: $0, value: event.source) }) {
+            return false
+        }
+
+        // Combined text filters (AND across fields)
+        if !rule.excludeKeywords.isEmpty && rule.excludeKeywords.contains(where: { haystack.contains($0.lowercased()) }) {
+            return false
+        }
+        if !rule.keywordsAny.isEmpty && !rule.keywordsAny.contains(where: { haystack.contains($0.lowercased()) }) {
+            return false
+        }
+        if !rule.keywordsAll.isEmpty && !rule.keywordsAll.allSatisfy({ haystack.contains($0.lowercased()) }) {
+            return false
+        }
+
+        // Title per-field filters
+        if !rule.titleEquals.isEmpty && !rule.titleEquals.contains(where: { title == $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }) {
+            return false
+        }
+        if !rule.titleAny.isEmpty && !rule.titleAny.contains(where: { title.contains($0.lowercased()) }) {
+            return false
+        }
+        if !rule.titleAll.isEmpty && !rule.titleAll.allSatisfy({ title.contains($0.lowercased()) }) {
+            return false
+        }
+        if !rule.titleExclude.isEmpty && rule.titleExclude.contains(where: { title.contains($0.lowercased()) }) {
+            return false
+        }
+
+        // Subtitle (sender) per-field filters
+        if !rule.subtitleEquals.isEmpty && !rule.subtitleEquals.contains(where: { subtitle == $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }) {
+            return false
+        }
+        if !rule.subtitleAny.isEmpty && !rule.subtitleAny.contains(where: { subtitle.contains($0.lowercased()) }) {
+            return false
+        }
+        if !rule.subtitleAll.isEmpty && !rule.subtitleAll.allSatisfy({ subtitle.contains($0.lowercased()) }) {
+            return false
+        }
+        if !rule.subtitleExclude.isEmpty && rule.subtitleExclude.contains(where: { subtitle.contains($0.lowercased()) }) {
+            return false
+        }
+
+        // Body per-field filters
+        if !rule.bodyAny.isEmpty && !rule.bodyAny.contains(where: { body.contains($0.lowercased()) }) {
+            return false
+        }
+        if !rule.bodyAll.isEmpty && !rule.bodyAll.allSatisfy({ body.contains($0.lowercased()) }) {
+            return false
+        }
+        if !rule.bodyExclude.isEmpty && rule.bodyExclude.contains(where: { body.contains($0.lowercased()) }) {
+            return false
+        }
+
+        // Working directory prefix filter
+        if !rule.cwdPrefix.isEmpty {
+            let rawCwd = event.payload["cwd"] ?? event.payload["root"] ?? ""
+            guard !rawCwd.isEmpty else { return false }
+            let canonicalCwd = Self.canonicalPath(rawCwd)
+            let matchedCwd = rule.cwdPrefix.contains { prefix in
+                let canonicalPrefix = Self.canonicalPath(prefix)
+                return canonicalCwd == canonicalPrefix || canonicalCwd.hasPrefix(canonicalPrefix + "/")
+            }
+            if !matchedCwd { return false }
+        }
+
+        return true
+    }
+
     private func matchFirstRule(for event: EventEnvelope) -> ChimeRule? {
         let snapshot = currentRules()
-        let haystack = event.searchableText.lowercased()
-
         for rule in snapshot where rule.enabled {
-            if !rule.matchTypes.isEmpty && !rule.matchTypes.contains(where: { wildcardMatch(pattern: $0, value: event.type) }) {
+            if let expect = rule.expectWindow, expect.enabled, expect.suppressOnMatch {
                 continue
             }
-            if !rule.matchSources.isEmpty && !rule.matchSources.contains(where: { wildcardMatch(pattern: $0, value: event.source) }) {
-                continue
+            if matchesRule(event, rule: rule) {
+                return rule
             }
-            if !rule.excludeKeywords.isEmpty && rule.excludeKeywords.contains(where: { haystack.contains($0.lowercased()) }) {
-                continue
-            }
-            if !rule.keywordsAny.isEmpty && !rule.keywordsAny.contains(where: { haystack.contains($0.lowercased()) }) {
-                continue
-            }
-            return rule
         }
         return nil
     }

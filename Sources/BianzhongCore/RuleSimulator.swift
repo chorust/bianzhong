@@ -54,7 +54,8 @@ public enum RuleSimulator {
         var directActionOnly = 0
 
         for event in events {
-            let disposition = funnel.ingest(event) { _, _ in }
+            let eventDate = parseEventTimestamp(event.ts) ?? Date()
+            let disposition = funnel.ingest(event, now: eventDate) { _, _ in }
             let title = event.payload["title"] ?? event.payload["command"] ?? event.correlationKey
 
             switch disposition {
@@ -150,5 +151,15 @@ public enum RuleSimulator {
             directActionOnly: directActionOnly,
             results: results
         )
+    }
+
+    private static func parseEventTimestamp(_ raw: String) -> Date? {
+        guard !raw.isEmpty else { return nil }
+        let frac = ISO8601DateFormatter()
+        frac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = frac.date(from: raw) { return d }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: raw)
     }
 }

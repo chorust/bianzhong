@@ -16,7 +16,13 @@ description: 一句话描述（L1 分诊也会参考此说明）
 match:
   type: ["dev.bianzhong.feishu.notification"]   # 支持 * 通配符，如 dev.bianzhong.*
   source: ["bz://sensor/feishu"]               # 留空匹配所有 source
-  keywords_any: ["报错", "500", "@"]            # 任一命中即触发（留空表示不限关键词）
+  title_equals: ["支付研发群"]                  # 精确匹配标题/群名（可与下方字段 AND 组合）
+  title_any: ["研发", "告警"]                   # 标题包含任一词（也支持 title_all / title_exclude）
+  subtitle_any: ["机器人"]                      # 发送者匹配（也支持 subtitle_equals / subtitle_all / subtitle_exclude）
+  body_any: ["报错", "500"]                     # 正文包含任一词
+  body_all: ["退款"]                            # 正文必须同时包含全部词（AND；也支持 body_exclude）
+  keywords_any: ["报错", "500", "@"]            # 全文任一命中即匹配（留空表示不限关键词）
+  keywords_all: ["线上"]                        # 全文必须同时包含全部词（AND）
   exclude_keywords: ["收到", "辛苦", "团建"]    # 命中任意词则直接拦截
 
 funnel:
@@ -24,10 +30,22 @@ funnel:
   debounce: 8s                                 # 连珠炮消息合并窗口
   max_wait: 30s
   cooldown: 15m
+  min_count: 1                                 # 设为 N (>1) 表示在 window 内累计命中第 N 次才触发
+  window: daily                                # 累计计数窗口：daily | 30m | 1h | 6h | 24h | 7d
+  count_scope: rule                            # rule（按规则计数）| correlation（按群/会话分别计数）
+  count_reset_on_trigger: true                 # 触发后清零重新计数
   defer_on_focus: true                         # 专注/锁屏时自动转入 Wake Digest 晨钟摘要
   triage:
     enabled: true
     provider: apple_fm                         # apple_fm | agent_cli | decision_api | none
+
+# 可选：预期时间窗口看门狗（在指定窗口内未收到匹配 match 的消息，则在窗口结束后自动拉起动作/Agent）
+# expect:
+#   enabled: true
+#   window: "09:00-09:30"                      # 或分别写 window_start / window_end (HH:mm)
+#   weekdays: ["mon", "tue", "wed", "thu", "fri"]
+#   suppress_on_match: true                    # 窗口内正常收到匹配消息时仅记为“已如期收到”，不触发告警
+#   grace_seconds: 0
 
 session:
   policy: threaded                             # ephemeral | threaded | rolling_daily

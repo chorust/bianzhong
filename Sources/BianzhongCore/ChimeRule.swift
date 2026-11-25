@@ -13,6 +13,63 @@ public enum AutonomyMode: String, Codable, Sendable {
     case boundedAuto = "bounded_auto"
 }
 
+public enum CountWindow: Codable, Sendable, Equatable {
+    case daily
+    case sliding(seconds: Int)
+
+    public var displayLabel: String {
+        switch self {
+        case .daily:
+            return "当日"
+        case .sliding(let sec):
+            if sec % 86400 == 0 { return "\(sec / 86400)d" }
+            if sec % 3600 == 0 { return "\(sec / 3600)h" }
+            if sec % 60 == 0 { return "\(sec / 60)m" }
+            return "\(sec)s"
+        }
+    }
+}
+
+public enum CountScope: String, Codable, Sendable, Equatable {
+    case rule
+    case correlation
+}
+
+/// Watchdog specification for "expected signal did not arrive within time window".
+public struct ExpectWindowSpec: Codable, Sendable, Equatable {
+    public var enabled: Bool
+    /// Local wall-clock window start in `HH:mm` (e.g. `"09:00"`).
+    public var windowStart: String
+    /// Local wall-clock window end in `HH:mm` (e.g. `"09:30"`).
+    public var windowEnd: String
+    /// ISO weekdays `1...7` (`1 = Monday ... 7 = Sunday`). Empty means every day.
+    public var weekdays: [Int]
+    /// When `true` (default), a matching signal inside the window satisfies the expectation without triggering the missed-signal action.
+    public var suppressOnMatch: Bool
+    /// Optional grace period after `windowEnd` before firing missed-signal action.
+    public var graceSeconds: Int
+
+    public init(
+        enabled: Bool = true,
+        windowStart: String,
+        windowEnd: String,
+        weekdays: [Int] = [],
+        suppressOnMatch: Bool = true,
+        graceSeconds: Int = 0
+    ) {
+        self.enabled = enabled
+        self.windowStart = windowStart
+        self.windowEnd = windowEnd
+        self.weekdays = weekdays
+        self.suppressOnMatch = suppressOnMatch
+        self.graceSeconds = max(0, graceSeconds)
+    }
+
+    public var displayLabel: String {
+        "\(windowStart)–\(windowEnd)"
+    }
+}
+
 public struct WorkspaceEntry: Codable, Sendable, Equatable {
     public let name: String
     public let path: String
@@ -155,7 +212,7 @@ public struct AppConfig: Sendable, Equatable {
             currentWorkspace = [:]
         }
 
-        for rawLine in yaml.components(separatedBy: .newlines) {
+        for rawLine in splitLines(yaml) {
             let trimmed = stripComment(rawLine).trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty { continue }
             let indent = rawLine.prefix { $0 == " " }.count
@@ -220,7 +277,7 @@ public struct AppConfig: Sendable, Equatable {
     /// Updates or inserts `feishu_sensor_enabled` at top level inside `config.yml` without disturbing nested keys or comments.
     public static func setFeishuSensorEnabled(_ enabled: Bool, in configFile: URL) throws {
         let existing = (try? String(contentsOf: configFile, encoding: .utf8)) ?? ""
-        var lines = existing.components(separatedBy: .newlines)
+        var lines = splitLines(existing)
         var replaced = false
         for idx in lines.indices {
             let line = lines[idx]
@@ -269,18 +326,38 @@ public struct AppConfig: Sendable, Equatable {
 }
 
 /// Declarative trigger + funnel + execution playbook loaded from `chimes/*.md`.
-public struct ChimeRule: Sendable, Equatable {
+public struct ChimeRule: Sendable, Equatable, Identifiable {
     public var id: String
+    public var filePath: String?
+    public var fileModifiedAt: Date?
     public var enabled: Bool
     public var description: String
     public var matchTypes: [String]
     public var matchSources: [String]
     public var keywordsAny: [String]
+    public var keywordsAll: [String]
     public var excludeKeywords: [String]
+    public var titleEquals: [String]
+    public var titleAny: [String]
+    public var titleAll: [String]
+    public var titleExclude: [String]
+    public var subtitleEquals: [String]
+    public var subtitleAny: [String]
+    public var subtitleAll: [String]
+    public var subtitleExclude: [String]
+    public var bodyAny: [String]
+    public var bodyAll: [String]
+    public var bodyExclude: [String]
+    public var cwdPrefix: [String]
     public var dedupTTLSeconds: Int
     public var debounceSeconds: Double
     public var maxWaitSeconds: Double
     public var cooldownSeconds: Int
+    public var minCount: Int
+    public var countWindow: CountWindow
+    public var countScope: CountScope
+    public var countResetOnTrigger: Bool
+    public var expectWindow: ExpectWindowSpec?
     public var deferOnFocus: Bool
     public var triageEnabled: Bool
     public var triageProviderOverride: String?
@@ -303,16 +380,36 @@ public struct ChimeRule: Sendable, Equatable {
 
     public init(
         id: String,
+        filePath: String? = nil,
+        fileModifiedAt: Date? = nil,
         enabled: Bool = true,
         description: String = "",
         matchTypes: [String] = [],
         matchSources: [String] = [],
         keywordsAny: [String] = [],
+        keywordsAll: [String] = [],
         excludeKeywords: [String] = [],
+        titleEquals: [String] = [],
+        titleAny: [String] = [],
+        titleAll: [String] = [],
+        titleExclude: [String] = [],
+        subtitleEquals: [String] = [],
+        subtitleAny: [String] = [],
+        subtitleAll: [String] = [],
+        subtitleExclude: [String] = [],
+        bodyAny: [String] = [],
+        bodyAll: [String] = [],
+        bodyExclude: [String] = [],
+        cwdPrefix: [String] = [],
         dedupTTLSeconds: Int = 300,
         debounceSeconds: Double = 5.0,
         maxWaitSeconds: Double = 30.0,
         cooldownSeconds: Int = 900,
+        minCount: Int = 1,
+        countWindow: CountWindow = .daily,
+        countScope: CountScope = .rule,
+        countResetOnTrigger: Bool = true,
+        expectWindow: ExpectWindowSpec? = nil,
         deferOnFocus: Bool = true,
         triageEnabled: Bool = false,
         triageProviderOverride: String? = nil,
@@ -334,16 +431,36 @@ public struct ChimeRule: Sendable, Equatable {
         phase2Prompt: String = ""
     ) {
         self.id = id
+        self.filePath = filePath
+        self.fileModifiedAt = fileModifiedAt
         self.enabled = enabled
         self.description = description
         self.matchTypes = matchTypes
         self.matchSources = matchSources
         self.keywordsAny = keywordsAny
+        self.keywordsAll = keywordsAll
         self.excludeKeywords = excludeKeywords
+        self.titleEquals = titleEquals
+        self.titleAny = titleAny
+        self.titleAll = titleAll
+        self.titleExclude = titleExclude
+        self.subtitleEquals = subtitleEquals
+        self.subtitleAny = subtitleAny
+        self.subtitleAll = subtitleAll
+        self.subtitleExclude = subtitleExclude
+        self.bodyAny = bodyAny
+        self.bodyAll = bodyAll
+        self.bodyExclude = bodyExclude
+        self.cwdPrefix = cwdPrefix
         self.dedupTTLSeconds = dedupTTLSeconds
         self.debounceSeconds = debounceSeconds
         self.maxWaitSeconds = maxWaitSeconds
         self.cooldownSeconds = cooldownSeconds
+        self.minCount = max(1, minCount)
+        self.countWindow = countWindow
+        self.countScope = countScope
+        self.countResetOnTrigger = countResetOnTrigger
+        self.expectWindow = expectWindow
         self.deferOnFocus = deferOnFocus
         self.triageEnabled = triageEnabled
         self.triageProviderOverride = triageProviderOverride
@@ -376,13 +493,124 @@ public struct ChimeRule: Sendable, Equatable {
             .compactMap { url in
                 guard let content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
                 let fallbackID = url.deletingPathExtension().lastPathComponent
-                return parse(markdown: content, defaultID: fallbackID)
+                var rule = parse(markdown: content, defaultID: fallbackID)
+                rule.filePath = url.path
+                rule.fileModifiedAt = (try? fm.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
+                return rule
             }
+    }
+
+    /// Updates or inserts `enabled: true/false` in the YAML frontmatter of a chime `.md` file without disturbing other fields.
+    public static func setEnabled(_ enabled: Bool, in fileURL: URL) throws {
+        let content = try String(contentsOf: fileURL, encoding: .utf8)
+        var lines = splitLines(content)
+        guard lines.first?.trimmingCharacters(in: .whitespaces) == "---" else {
+            let updated = "---\nenabled: \(enabled)\n---\n\n\(content)"
+            try updated.write(to: fileURL, atomically: true, encoding: .utf8)
+            return
+        }
+
+        var closingIndex: Int?
+        var replaced = false
+        for idx in 1..<lines.count {
+            let trimmed = lines[idx].trimmingCharacters(in: .whitespaces)
+            if trimmed == "---" {
+                closingIndex = idx
+                break
+            }
+            let isTopLevel = lines[idx].prefix { $0 == " " || $0 == "\t" }.isEmpty
+            if isTopLevel,
+               let (k, _) = splitKeyValue(stripComment(lines[idx])),
+               k == "enabled" {
+                if let hashIdx = lines[idx].firstIndex(of: "#") {
+                    lines[idx] = "enabled: \(enabled)   \(lines[idx][hashIdx...])"
+                } else {
+                    lines[idx] = "enabled: \(enabled)"
+                }
+                replaced = true
+                break
+            }
+        }
+
+        if !replaced {
+            let insertAt = min(closingIndex ?? lines.count, lines.count)
+            // Prefer inserting right after `id:` if present
+            if let idIdx = (1..<insertAt).first(where: { idx in
+                let isTopLevel = lines[idx].prefix { $0 == " " || $0 == "\t" }.isEmpty
+                return isTopLevel && splitKeyValue(stripComment(lines[idx]))?.0 == "id"
+            }) {
+                lines.insert("enabled: \(enabled)", at: idIdx + 1)
+            } else {
+                lines.insert("enabled: \(enabled)", at: min(1, lines.count))
+            }
+        }
+
+        let joined = lines.joined(separator: "\n")
+        try joined.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+
+    /// Builds a concise human-readable match summary for UI display.
+    public var matchSummary: String {
+        var parts: [String] = []
+        if !titleEquals.isEmpty {
+            parts.append("标题=\(titleEquals.prefix(2).joined(separator: "/"))")
+        } else if !titleAny.isEmpty {
+            parts.append("标题含 \(titleAny.prefix(2).joined(separator: "/"))")
+        } else if !titleAll.isEmpty {
+            parts.append("标题全含 \(titleAll.prefix(2).joined(separator: "+"))")
+        }
+        if !bodyAll.isEmpty {
+            parts.append("正文全含 \(bodyAll.prefix(2).joined(separator: "+"))")
+        } else if !bodyAny.isEmpty {
+            parts.append("正文含 \(bodyAny.prefix(2).joined(separator: "/"))")
+        }
+        if !keywordsAll.isEmpty {
+            parts.append("全含 \(keywordsAll.prefix(2).joined(separator: "+"))")
+        } else if !keywordsAny.isEmpty {
+            parts.append("含 \(keywordsAny.prefix(3).joined(separator: "/"))")
+        }
+        if parts.isEmpty, !matchTypes.isEmpty {
+            parts.append(matchTypes.prefix(2).joined(separator: ", "))
+        }
+        return parts.isEmpty ? "全部事件" : parts.joined(separator: " · ")
+    }
+
+    /// Generates a synthetic matching event suitable for quick interactive testing in MenuBar/CLI.
+    public func sampleTestEvent() -> EventEnvelope {
+        let type = matchTypes.first.map { $0.replacingOccurrences(of: "*", with: "test") } ?? "dev.bianzhong.manual"
+        let source = matchSources.first.map { $0.replacingOccurrences(of: "*", with: "test") } ?? "bz://test/menubar"
+        let title = titleEquals.first ?? titleAll.joined(separator: " ") .nilIfEmpty ?? titleAny.first ?? "测试信号 (\(id))"
+        let subtitle = subtitleEquals.first ?? subtitleAll.joined(separator: " ").nilIfEmpty ?? subtitleAny.first ?? "Bianzhong Test"
+        var bodyTokens: [String] = []
+        bodyTokens.append(contentsOf: bodyAll)
+        if let firstBodyAny = bodyAny.first { bodyTokens.append(firstBodyAny) }
+        bodyTokens.append(contentsOf: keywordsAll)
+        if let firstKwAny = keywordsAny.first { bodyTokens.append(firstKwAny) }
+        let body = bodyTokens.isEmpty ? "测试规则 \(id) 的模拟消息" : "测试信号：\(bodyTokens.joined(separator: " "))"
+
+        var payload: [String: String] = [
+            "title": title,
+            "subtitle": subtitle,
+            "body": body
+        ]
+        if let cwd = cwdPrefix.first {
+            payload["cwd"] = cwd
+        } else if workingDir != "$payload.cwd" && workingDir != "auto" && workingDir != "." {
+            payload["cwd"] = workingDir
+        }
+        return EventEnvelope(
+            source: source,
+            type: type,
+            correlationKey: "test:\(id):\(title)",
+            privacyLevel: .internal,
+            payload: payload,
+            ambientContext: .captureCurrent()
+        )
     }
 
     /// Parses YAML frontmatter (`--- ... ---`) plus `## Phase 1` and `## Phase 2` Markdown bodies.
     public static func parse(markdown: String, defaultID: String) -> ChimeRule {
-        let lines = markdown.components(separatedBy: .newlines)
+        let lines = splitLines(markdown)
         var frontmatterLines: [String] = []
         var bodyLines: [String] = []
 
@@ -409,12 +637,16 @@ public struct ChimeRule: Sendable, Equatable {
         }
 
         var rule = ChimeRule(id: defaultID)
-        var section = ""
-        var subSection = ""
-        var subIndent = Int.max
+        var path: [(indent: Int, key: String)] = []
         var sawOnComplete = false
         var parsedActions: [ActionSpec] = []
         var currentAction: ActionSpec?
+        var expectEnabled: Bool?
+        var expectStart: String?
+        var expectEnd: String?
+        var expectWeekdays: [Int] = []
+        var expectSuppressOnMatch: Bool = true
+        var expectGraceSeconds: Int = 0
 
         func flushAction() {
             if let action = currentAction {
@@ -449,6 +681,46 @@ public struct ChimeRule: Sendable, Equatable {
             }
         }
 
+        func appendListItem(_ rawItem: String, for keys: [String]) {
+            let item = unquote(rawItem)
+            guard !item.isEmpty, item != "null" else { return }
+            let sec = keys.first ?? ""
+            let sub = keys.count >= 3 ? keys[1] : ""
+            let leaf = keys.count >= 2 ? keys.last! : ""
+            switch (sec, sub, leaf) {
+            case ("match", "", "type"): rule.matchTypes.append(item)
+            case ("match", "", "source"): rule.matchSources.append(item)
+            case ("match", "", "keywords_any"): rule.keywordsAny.append(item)
+            case ("match", "", "keywords_all"): rule.keywordsAll.append(item)
+            case ("match", "", "exclude_keywords"): rule.excludeKeywords.append(item)
+            case ("match", "", "title_equals"), ("match", "title", "equals"): rule.titleEquals.append(item)
+            case ("match", "", "title_any"), ("match", "", "title_contains"), ("match", "title", "any"), ("match", "title", "contains"):
+                rule.titleAny.append(item)
+            case ("match", "", "title_all"), ("match", "title", "all"): rule.titleAll.append(item)
+            case ("match", "", "title_exclude"), ("match", "title", "exclude"): rule.titleExclude.append(item)
+            case ("match", "", "subtitle_equals"), ("match", "subtitle", "equals"): rule.subtitleEquals.append(item)
+            case ("match", "", "subtitle_any"), ("match", "", "subtitle_contains"), ("match", "subtitle", "any"), ("match", "subtitle", "contains"):
+                rule.subtitleAny.append(item)
+            case ("match", "", "subtitle_all"), ("match", "subtitle", "all"): rule.subtitleAll.append(item)
+            case ("match", "", "subtitle_exclude"), ("match", "subtitle", "exclude"): rule.subtitleExclude.append(item)
+            case ("match", "", "body_any"), ("match", "", "body_contains"), ("match", "body", "any"), ("match", "body", "contains"):
+                rule.bodyAny.append(item)
+            case ("match", "", "body_all"), ("match", "body", "all"): rule.bodyAll.append(item)
+            case ("match", "", "body_exclude"), ("match", "body", "exclude"): rule.bodyExclude.append(item)
+            case ("match", "", "cwd_prefix"), ("match", "cwd", "prefix"):
+                rule.cwdPrefix.append(expandTilde(item))
+            case ("expect", "", "weekdays"):
+                let parsed = parseWeekdays(item)
+                if item.lowercased() == "*" || item.lowercased() == "all" || item.lowercased() == "daily" || item.lowercased() == "everyday" {
+                    expectWeekdays = []
+                } else {
+                    expectWeekdays = Array(Set(expectWeekdays + parsed)).sorted()
+                }
+            default:
+                break
+            }
+        }
+
         for rawLine in frontmatterLines {
             let clean = stripComment(rawLine).trimmingCharacters(in: .whitespaces)
             if clean.isEmpty { continue }
@@ -456,17 +728,16 @@ public struct ChimeRule: Sendable, Equatable {
 
             if indent == 0 {
                 flushAction()
-                subSection = ""
-                subIndent = Int.max
+                path.removeAll()
                 if clean.hasSuffix(":") {
-                    section = String(clean.dropLast()).trimmingCharacters(in: .whitespaces)
-                    if section == "on_complete" {
+                    let topKey = String(clean.dropLast()).trimmingCharacters(in: .whitespaces)
+                    path.append((indent: 0, key: topKey))
+                    if topKey == "on_complete" {
                         sawOnComplete = true
                     }
                     continue
                 }
-                section = ""
-            } else if section == "on_complete" {
+            } else if path.first?.key == "on_complete" {
                 if clean.hasPrefix("- ") {
                     flushAction()
                     let rest = String(clean.dropFirst(2)).trimmingCharacters(in: .whitespaces)
@@ -478,19 +749,28 @@ public struct ChimeRule: Sendable, Equatable {
                 }
                 continue
             } else {
-                if indent <= subIndent {
-                    subSection = ""
-                    subIndent = Int.max
+                if clean.hasPrefix("- ") {
+                    while let last = path.last, last.indent >= indent {
+                        path.removeLast()
+                    }
+                    let rest = String(clean.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                    appendListItem(rest, for: path.map(\.key))
+                    continue
+                }
+                while let last = path.last, last.indent >= indent {
+                    path.removeLast()
                 }
                 if clean.hasSuffix(":") {
-                    subSection = String(clean.dropLast()).trimmingCharacters(in: .whitespaces)
-                    subIndent = indent
+                    let subKey = String(clean.dropLast()).trimmingCharacters(in: .whitespaces)
+                    path.append((indent: indent, key: subKey))
                     continue
                 }
             }
 
             guard let (key, value) = splitKeyValue(clean) else { continue }
             let val = unquote(value)
+            let section = path.first?.key ?? ""
+            let subSection = path.count >= 2 ? path[1].key : ""
 
             switch (section, subSection, key) {
             case ("", "", "id"): rule.id = val
@@ -508,16 +788,63 @@ public struct ChimeRule: Sendable, Equatable {
             case ("match", "", "type"): rule.matchTypes = parseArray(value)
             case ("match", "", "source"): rule.matchSources = parseArray(value)
             case ("match", "", "keywords_any"): rule.keywordsAny = parseArray(value)
+            case ("match", "", "keywords_all"): rule.keywordsAll = parseArray(value)
             case ("match", "", "exclude_keywords"): rule.excludeKeywords = parseArray(value)
+            case ("match", "", "title_equals"), ("match", "title", "equals"): rule.titleEquals = parseArray(value)
+            case ("match", "", "title_any"), ("match", "", "title_contains"), ("match", "title", "any"), ("match", "title", "contains"):
+                rule.titleAny = parseArray(value)
+            case ("match", "", "title_all"), ("match", "title", "all"): rule.titleAll = parseArray(value)
+            case ("match", "", "title_exclude"), ("match", "title", "exclude"): rule.titleExclude = parseArray(value)
+            case ("match", "", "subtitle_equals"), ("match", "subtitle", "equals"): rule.subtitleEquals = parseArray(value)
+            case ("match", "", "subtitle_any"), ("match", "", "subtitle_contains"), ("match", "subtitle", "any"), ("match", "subtitle", "contains"):
+                rule.subtitleAny = parseArray(value)
+            case ("match", "", "subtitle_all"), ("match", "subtitle", "all"): rule.subtitleAll = parseArray(value)
+            case ("match", "", "subtitle_exclude"), ("match", "subtitle", "exclude"): rule.subtitleExclude = parseArray(value)
+            case ("match", "", "body_any"), ("match", "", "body_contains"), ("match", "body", "any"), ("match", "body", "contains"):
+                rule.bodyAny = parseArray(value)
+            case ("match", "", "body_all"), ("match", "body", "all"): rule.bodyAll = parseArray(value)
+            case ("match", "", "body_exclude"), ("match", "body", "exclude"): rule.bodyExclude = parseArray(value)
+            case ("match", "", "cwd_prefix"), ("match", "cwd", "prefix"):
+                rule.cwdPrefix = parseArray(value).map { expandTilde($0) }
             case ("funnel", "", "dedup_ttl"): rule.dedupTTLSeconds = parseDurationSeconds(val) ?? rule.dedupTTLSeconds
             case ("funnel", "", "debounce"): rule.debounceSeconds = parseDurationDouble(val) ?? rule.debounceSeconds
             case ("funnel", "", "max_wait"): rule.maxWaitSeconds = parseDurationDouble(val) ?? rule.maxWaitSeconds
             case ("funnel", "", "cooldown"): rule.cooldownSeconds = parseDurationSeconds(val) ?? rule.cooldownSeconds
+            case ("funnel", "", "min_count"), ("funnel", "threshold", "min_count"):
+                rule.minCount = max(1, Int(val) ?? rule.minCount)
+            case ("funnel", "", "window"), ("funnel", "", "count_window"), ("funnel", "threshold", "window"):
+                if let parsed = parseCountWindow(val) {
+                    rule.countWindow = parsed
+                }
+            case ("funnel", "", "count_scope"), ("funnel", "threshold", "scope"):
+                if let scope = CountScope(rawValue: val.lowercased()) {
+                    rule.countScope = scope
+                }
+            case ("funnel", "", "count_reset_on_trigger"), ("funnel", "threshold", "reset_on_trigger"):
+                rule.countResetOnTrigger = parseBool(val, default: rule.countResetOnTrigger)
             case ("funnel", "", "defer_on_focus"): rule.deferOnFocus = parseBool(val, default: rule.deferOnFocus)
             case ("funnel", "", "triage_enabled"), ("funnel", "triage", "enabled"):
                 rule.triageEnabled = parseBool(val, default: rule.triageEnabled)
             case ("funnel", "", "triage_provider"), ("funnel", "triage", "provider"):
                 rule.triageProviderOverride = (val.isEmpty || val == "null") ? nil : val
+            case ("expect", "", "enabled"):
+                expectEnabled = parseBool(val, default: true)
+            case ("expect", "", "window"):
+                let parts = val.split(separator: "-", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
+                if parts.count == 2 {
+                    expectStart = parts[0]
+                    expectEnd = parts[1]
+                }
+            case ("expect", "", "window_start"), ("expect", "", "start"):
+                expectStart = val
+            case ("expect", "", "window_end"), ("expect", "", "end"):
+                expectEnd = val
+            case ("expect", "", "weekdays"):
+                expectWeekdays = parseWeekdays(value)
+            case ("expect", "", "suppress_on_match"):
+                expectSuppressOnMatch = parseBool(val, default: true)
+            case ("expect", "", "grace"), ("expect", "", "grace_seconds"):
+                expectGraceSeconds = max(0, parseDurationSeconds(val) ?? 0)
             case ("session", "", "policy"): rule.sessionPolicy = SessionPolicy(rawValue: val) ?? rule.sessionPolicy
             case ("session", "", "ttl"): rule.sessionTTLSeconds = parseDurationSeconds(val) ?? rule.sessionTTLSeconds
             case ("execution", "", "autonomy"): rule.autonomy = AutonomyMode(rawValue: val) ?? rule.autonomy
@@ -538,6 +865,17 @@ public struct ChimeRule: Sendable, Equatable {
         if sawOnComplete {
             rule.onComplete = parsedActions
         }
+        if let start = expectStart, let end = expectEnd, !start.isEmpty, !end.isEmpty {
+            let isEnabled = expectEnabled ?? true
+            rule.expectWindow = ExpectWindowSpec(
+                enabled: isEnabled,
+                windowStart: start,
+                windowEnd: end,
+                weekdays: expectWeekdays,
+                suppressOnMatch: expectSuppressOnMatch,
+                graceSeconds: expectGraceSeconds
+            )
+        }
 
         let (p1, p2) = extractPhasePrompts(bodyLines.joined(separator: "\n"))
         rule.phase1Prompt = p1
@@ -546,7 +884,7 @@ public struct ChimeRule: Sendable, Equatable {
     }
 
     private static func extractPhasePrompts(_ body: String) -> (String, String) {
-        let lines = body.components(separatedBy: .newlines)
+        let lines = splitLines(body)
         var phase1: [String] = []
         var phase2: [String] = []
         var current = 1
@@ -575,6 +913,13 @@ public struct ChimeRule: Sendable, Equatable {
 }
 
 // MARK: - Lightweight YAML Parsing Helpers
+
+private func splitLines(_ text: String) -> [String] {
+    text
+        .replacingOccurrences(of: "\r\n", with: "\n")
+        .replacingOccurrences(of: "\r", with: "\n")
+        .components(separatedBy: "\n")
+}
 
 private func stripComment(_ line: String) -> String {
     var inSingle = false
@@ -642,9 +987,52 @@ private func parseDurationDouble(_ value: String) -> Double? {
     if s.hasSuffix("s"), let num = Double(s.dropLast(1)) { return num }
     if s.hasSuffix("m"), let num = Double(s.dropLast(1)) { return num * 60.0 }
     if s.hasSuffix("h"), let num = Double(s.dropLast(1)) { return num * 3600.0 }
+    if s.hasSuffix("d"), let num = Double(s.dropLast(1)) { return num * 86400.0 }
     return Double(s)
+}
+
+private func parseCountWindow(_ value: String) -> CountWindow? {
+    let s = value.lowercased().trimmingCharacters(in: .whitespaces)
+    if s == "daily" || s == "today" || s == "day" {
+        return .daily
+    }
+    if let sec = parseDurationSeconds(s), sec > 0 {
+        return .sliding(seconds: sec)
+    }
+    return nil
+}
+
+private func parseWeekdays(_ raw: String) -> [Int] {
+    let tokens = parseArray(raw)
+    var result: [Int] = []
+    for tok in tokens {
+        let lower = tok.lowercased()
+        switch lower {
+        case "*", "all", "daily", "everyday":
+            return []
+        case "weekday", "weekdays", "workday", "workdays":
+            result.append(contentsOf: [1, 2, 3, 4, 5])
+        case "weekend", "weekends":
+            result.append(contentsOf: [6, 7])
+        case "mon", "monday", "1": result.append(1)
+        case "tue", "tues", "tuesday", "2": result.append(2)
+        case "wed", "wednesday", "3": result.append(3)
+        case "thu", "thur", "thurs", "thursday", "4": result.append(4)
+        case "fri", "friday", "5": result.append(5)
+        case "sat", "saturday", "6": result.append(6)
+        case "sun", "sunday", "7", "0": result.append(7)
+        default: break
+        }
+    }
+    return Array(Set(result)).sorted()
 }
 
 private func expandTilde(_ path: String) -> String {
     NSString(string: path).expandingTildeInPath
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
 }
