@@ -992,7 +992,7 @@ public final class SQLiteStore: @unchecked Sendable {
 
         let sql = """
         SELECT status FROM runs
-        WHERE chime_id = ? AND started_at >= ? AND phase IN ('draft', 'execute')
+        WHERE chime_id = ? AND started_at > ? AND phase IN ('draft', 'execute')
           AND status NOT IN ('queued', 'running')
         ORDER BY started_at DESC LIMIT ?;
         """
