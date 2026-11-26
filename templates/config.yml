@@ -1,8 +1,15 @@
 # Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)
-terminal: auto                # auto | ghostty | iterm | warp | terminal
+terminal: auto                # auto | ghostty | iterm | warp | kitty | wezterm | alacritty | cmux | terminal
 feishu_sensor_enabled: true   # 需在 系统设置 -> 完全磁盘访问权限 中授予 Bianzhong.app
 max_concurrent_runs: 2
 max_causal_depth: 1
+
+# 入站/出站双向 Webhook 网关（Token 自动保存在本地 0600 secrets.json，不入库 Git）
+webhook_server:
+  enabled: true
+  host: 127.0.0.1             # 如需内网/Tailscale 回调可改为 0.0.0.0
+  port: 17380
+  callback_base_url: null     # 例如 https://macbook.tailnet.ts.net:17380（供飞书卡片一键远程批准按钮回调）
 
 # 全局预算、熔断与自动清理治理
 governance:

@@ -1668,4 +1668,522 @@ struct BianzhongCoreTests {
         let goodTarget = EventEnvelope(source: "bz://test", type: "dev.bianzhong.feishu.notification", correlationKey: "t", payload: ["title": "专属群"])
         #expect(orch.triggerRuleTest(ruleID: "99-specific", event: goodTarget).ok == true)
     }
+
+    @Test("23. SecretStore, Terminal selector, Config/Rule serialization, URL scheme, Outbound webhook signing, and Inbound WebhookServer")
+    func unifiedConsoleConfigSecretsTerminalAndWebhookGateway() async throws {
+        let shortID = String(UUID().uuidString.prefix(8))
+        let stateDir = URL(fileURLWithPath: "/tmp/bz-s23-\(shortID)", isDirectory: true)
+        let cfgDir = URL(fileURLWithPath: "/tmp/bz-c23-\(shortID)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: stateDir)
+            try? FileManager.default.removeItem(at: cfgDir)
+        }
+        let paths = BianzhongPaths(configDir: cfgDir, stateDir: stateDir)
+        try paths.ensureDirectories()
+
+        // (a) SecretStore 0600 permissions, CRUD, env fallback, and token rotation
+        let initialToken = SecretStore.ensureWebhookToken(paths: paths)
+        #expect(initialToken.count >= 32)
+        #expect(SecretStore.ensureWebhookToken(paths: paths) == initialToken)
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: paths.secretsFile.path)
+        let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        #expect((perms & 0o777) == 0o600)
+
+        try SecretStore.set(key: "FEISHU_BOT_SECRET", value: "sec-1234567890", paths: paths)
+        #expect(SecretStore.resolve("FEISHU_BOT_SECRET", paths: paths) == "sec-1234567890")
+        #expect(SecretStore.maskedPreview("sec-1234567890") == "sec-••••7890")
+        #expect(SecretStore.resolve("PATH", paths: paths)?.isEmpty == false) // fallback to ProcessInfo.environment
+
+        let rotatedToken = try SecretStore.rotateWebhookToken(paths: paths)
+        #expect(rotatedToken != initialToken)
+        #expect(SecretStore.resolve(SecretStore.webhookTokenKey, paths: paths) == rotatedToken)
+
+        try SecretStore.remove(key: "FEISHU_BOT_SECRET", paths: paths)
+        #expect(SecretStore.loadAll(paths: paths)["FEISHU_BOT_SECRET"] == nil)
+
+        // (b) Terminal selector covers all 8 terminals cleanly
+        #expect(TerminalLauncher.TerminalApp.allCases.count == 8)
+        #expect(TerminalLauncher.detectTerminal(preference: "ghostty") == .ghostty)
+        #expect(TerminalLauncher.detectTerminal(preference: "iterm") == .iterm)
+        #expect(TerminalLauncher.detectTerminal(preference: "iterm2") == .iterm)
+        #expect(TerminalLauncher.detectTerminal(preference: "warp") == .warp)
+        #expect(TerminalLauncher.detectTerminal(preference: "kitty") == .kitty)
+        #expect(TerminalLauncher.detectTerminal(preference: "wezterm") == .wezterm)
+        #expect(TerminalLauncher.detectTerminal(preference: "alacritty") == .alacritty)
+        #expect(TerminalLauncher.detectTerminal(preference: "cmux") == .cmux)
+        #expect(TerminalLauncher.detectTerminal(preference: "terminal") == .terminal)
+
+        // (c) AppConfig.save & ChimeRule.serializeToMarkdown round-trip fidelity
+        var cfg = AppConfig(
+            triageProvider: "decision_api",
+            decisionAPIURL: "https://triage.example.com/v1",
+            decisionAPIKeyEnv: "MY_TRIAGE_KEY",
+            decisionAPITimeoutSeconds: 5.5,
+            agentCLIDriver: "codex",
+            agentCLIModel: "gpt-5-mini",
+            terminal: "warp",
+            feishuSensorEnabled: false,
+            webhookServerEnabled: true,
+            webhookHost: "127.0.0.1",
+            webhookPort: 0,
+            webhookCallbackBaseURL: "https://mac.tailnet.ts.net:17380",
+            maxConcurrentRuns: 3,
+            maxCausalDepth: 2,
+            dailyMaxCostUSD: 4.5,
+            dailyMaxRuns: 42,
+            circuitBreakerFailures: 4,
+            retentionDays: 14,
+            workspaces: [WorkspaceEntry(name: "core", path: "/tmp/core", summary: "Core workspace")]
+        )
+        try AppConfig.save(cfg, to: paths.configFile)
+        try AppConfig.setTerminal("iterm", in: paths.configFile)
+        let reloadedCfg = AppConfig.load(from: paths.configFile)
+        #expect(reloadedCfg.terminal == "iterm")
+        #expect(reloadedCfg.dailyMaxRuns == 42)
+        #expect(reloadedCfg.webhookServerEnabled == true)
+        #expect(reloadedCfg.webhookPort == 0)
+        #expect(reloadedCfg.webhookCallbackBaseURL == "https://mac.tailnet.ts.net:17380")
+        #expect(reloadedCfg.triageProvider == "decision_api")
+        #expect(reloadedCfg.workspaces.first?.name == "core")
+
+        // Restore ephemeral port config with terminal warp via save
+        cfg.terminal = "warp"
+        try AppConfig.save(cfg, to: paths.configFile)
+
+        let originalRule = ChimeRule(
+            id: "webhook-ci-watch",
+            enabled: true,
+            description: "监听 GitHub Actions 失败并推送飞书卡片",
+            matchTypes: ["dev.bianzhong.ci.failed", "dev.bianzhong.url.emit"],
+            titleAny: ["CI", "Build"],
+            bodyExclude: ["skip-bz"],
+            dedupTTLSeconds: 120,
+            debounceSeconds: 0,
+            maxWaitSeconds: 15,
+            cooldownSeconds: 0,
+            minCount: 1,
+            countWindow: .daily,
+            countScope: .rule,
+            countResetOnTrigger: true,
+            expectWindow: ExpectWindowSpec(enabled: true, windowStart: "09:00", windowEnd: "09:30", weekdays: [1, 3, 5], suppressOnMatch: true, graceSeconds: 30),
+            deferOnFocus: false,
+            triageEnabled: false,
+            triageProviderOverride: "none",
+            sessionPolicy: .threaded,
+            sessionTTLSeconds: 3600,
+            autonomy: .notify,
+            driver: "none",
+            workingDir: "/tmp",
+            onComplete: [
+                ActionSpec(type: .notify),
+                ActionSpec(
+                    type: .webhook,
+                    whenCondition: "phase == 'notify'",
+                    preset: "feishu_bot",
+                    urlEnv: "FEISHU_HOOK_URL",
+                    secretEnv: "FEISHU_SIGN_KEY"
+                )
+            ],
+            phase1Prompt: "Phase 1 prompt text",
+            phase2Prompt: "Phase 2 prompt text"
+        )
+        let ruleURL = paths.chimesDir.appendingPathComponent("webhook-ci-watch.md")
+        try originalRule.save(to: ruleURL)
+        let reparsedRule = try #require(ChimeRule.loadAll(from: paths.chimesDir).first(where: { $0.id == "webhook-ci-watch" }))
+        #expect(reparsedRule.id == "webhook-ci-watch")
+        #expect(reparsedRule.matchTypes == ["dev.bianzhong.ci.failed", "dev.bianzhong.url.emit"])
+        #expect(reparsedRule.titleAny == ["CI", "Build"])
+        #expect(reparsedRule.bodyExclude == ["skip-bz"])
+        #expect(reparsedRule.expectWindow?.weekdays == [1, 3, 5])
+        #expect(reparsedRule.onComplete.count == 2)
+        #expect(reparsedRule.onComplete.last?.preset == "feishu_bot")
+        #expect(reparsedRule.onComplete.last?.secretEnv == "FEISHU_SIGN_KEY")
+        #expect(reparsedRule.phase1Prompt == "Phase 1 prompt text")
+        #expect(reparsedRule.phase2Prompt == "Phase 2 prompt text")
+
+        // Disable expect window for live webhook ingestion test below
+        var liveRule = reparsedRule
+        liveRule.expectWindow = nil
+        try liveRule.save(to: ruleURL)
+
+        // (d) OutboundWebhookBuilder: Feishu bot HMAC-SHA256 sign + signed remote approval URL verification
+        let approveCB = try #require(OutboundWebhookBuilder.signedApprovalURL(
+            baseURL: "http://127.0.0.1:17380",
+            approvalID: "apr-test-1",
+            action: "approve",
+            token: rotatedToken,
+            ttlSeconds: 600,
+            nowUnix: 1_700_000_000
+        ))
+        let cbComps = try #require(URLComponents(string: approveCB))
+        let expParam = cbComps.queryItems?.first(where: { $0.name == "exp" })?.value
+        let sigParam = cbComps.queryItems?.first(where: { $0.name == "sig" })?.value
+        #expect(OutboundWebhookBuilder.verifyApprovalSignature(
+            approvalID: "apr-test-1",
+            action: "approve",
+            expString: expParam,
+            signature: sigParam,
+            token: rotatedToken,
+            nowUnix: 1_700_000_300
+        ) == true)
+        // Expired link rejected
+        #expect(OutboundWebhookBuilder.verifyApprovalSignature(
+            approvalID: "apr-test-1",
+            action: "approve",
+            expString: expParam,
+            signature: sigParam,
+            token: rotatedToken,
+            nowUnix: 1_700_000_900
+        ) == false)
+        // Action mismatch ("reject" using "approve" signature) rejected
+        #expect(OutboundWebhookBuilder.verifyApprovalSignature(
+            approvalID: "apr-test-1",
+            action: "reject",
+            expString: expParam,
+            signature: sigParam,
+            token: rotatedToken,
+            nowUnix: 1_700_000_300
+        ) == false)
+
+        let feishuReq = try OutboundWebhookBuilder.build(
+            preset: .feishuBot,
+            title: "CI 失败告警",
+            text: "main 分支单测失败",
+            chimeID: "webhook-ci-watch",
+            phase: "propose",
+            riskLevel: "medium",
+            correlationKey: "ci:main",
+            sessionID: "ses-1",
+            approvalID: "apr-test-1",
+            secret: "bot-sec",
+            bearerToken: nil,
+            chatID: nil,
+            approveCallbackURL: approveCB,
+            rejectCallbackURL: nil
+        )
+        let feishuJSON = try #require(JSONSerialization.jsonObject(with: feishuReq.body) as? [String: Any])
+        #expect(feishuJSON["msg_type"] as? String == "interactive")
+        #expect((feishuJSON["sign"] as? String)?.isEmpty == false)
+        #expect((feishuJSON["timestamp"] as? String)?.isEmpty == false)
+        let feishuBodyStr = String(decoding: feishuReq.body, as: UTF8.self)
+        #expect(feishuBodyStr.contains("批准执行"))
+
+        // (e) BianzhongURLRouter parsing
+        let consoleURL = URL(string: "bianzhong://console?tab=webhooks&rule=webhook-ci-watch")!
+        #expect(BianzhongURLRouter.parse(consoleURL) == .openConsole(section: "webhooks", ruleID: "webhook-ci-watch"))
+        let approveDeepLink = URL(string: "bianzhong://approve?id=apr-99&note=ship&token=tok1")!
+        #expect(BianzhongURLRouter.parse(approveDeepLink) == .approve(id: "apr-99", comment: "ship", token: "tok1"))
+
+        // (f) Live Orchestrator + WebhookServer (ephemeral port 0) end-to-end HTTP + URL scheme + Audit funnel
+        let orch = try Orchestrator(paths: paths)
+        try orch.start(enableBuiltInSensors: false, enableWebhookServer: true)
+        defer { orch.stop() }
+
+        let whStatus = orch.webhookStatus()
+        #expect(whStatus.enabled == true)
+        #expect(whStatus.running == true)
+        #expect(whStatus.port > 0)
+        let base = "http://127.0.0.1:\(whStatus.port)"
+
+        // 1. GET /v1/health -> 200 without auth
+        let (_, healthResp) = try await URLSession.shared.data(from: URL(string: "\(base)/v1/health")!)
+        #expect((healthResp as? HTTPURLResponse)?.statusCode == 200)
+
+        // 2. POST /v1/emit without token -> 401
+        var unauthReq = URLRequest(url: URL(string: "\(base)/v1/emit")!)
+        unauthReq.httpMethod = "POST"
+        unauthReq.httpBody = Data(#"{"title":"CI","body":"fail"}"#.utf8)
+        let (_, unauthResp) = try await URLSession.shared.data(for: unauthReq)
+        #expect((unauthResp as? HTTPURLResponse)?.statusCode == 401)
+
+        // 3. POST /v1/hooks/feishu challenge verification via JSON body Verification Token (no Authorization header!)
+        var challengeReq = URLRequest(url: URL(string: "\(base)/v1/hooks/feishu")!)
+        challengeReq.httpMethod = "POST"
+        challengeReq.httpBody = Data(#"{"type":"url_verification","token":"\#(rotatedToken)","challenge":"bz-challenge-ok"}"#.utf8)
+        let (chalData, chalResp) = try await URLSession.shared.data(for: challengeReq)
+        #expect((chalResp as? HTTPURLResponse)?.statusCode == 200)
+        let chalObj = try #require(JSONSerialization.jsonObject(with: chalData) as? [String: Any])
+        #expect(chalObj["challenge"] as? String == "bz-challenge-ok")
+
+        // 4. POST /v1/hooks/github signed with X-Hub-Signature-256 (workflow_run failure -> dev.bianzhong.ci.failed)
+        let ghBody = Data(#"{"action":"completed","repository":{"full_name":"chorust/bianzhong"},"workflow_run":{"name":"CI Build","conclusion":"failure","head_branch":"main","html_url":"https://github.com/chorust/bianzhong/actions/runs/1"}}"#.utf8)
+        let ghSig = "sha256=" + OutboundWebhookBuilder.hmacSHA256Hex(key: rotatedToken, data: ghBody)
+        var ghReq = URLRequest(url: URL(string: "\(base)/v1/hooks/github")!)
+        ghReq.httpMethod = "POST"
+        ghReq.setValue("workflow_run", forHTTPHeaderField: "X-GitHub-Event")
+        ghReq.setValue(ghSig, forHTTPHeaderField: "X-Hub-Signature-256")
+        ghReq.httpBody = ghBody
+        let (_, ghResp) = try await URLSession.shared.data(for: ghReq)
+        #expect((ghResp as? HTTPURLResponse)?.statusCode == 200)
+
+        // Wait briefly for async notify approval creation
+        for _ in 0..<40 {
+            if !orch.pendingApprovals().isEmpty { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let pendingApr = try #require(orch.pendingApprovals().first)
+        #expect(pendingApr.chimeID == "webhook-ci-watch")
+
+        // 5. Signed remote approval callback: GET renders safe confirmation HTML WITHOUT resolving (unfurl-bot safe), POST resolves once!
+        let liveCallbackURL = try #require(OutboundWebhookBuilder.signedApprovalURL(
+            baseURL: base,
+            approvalID: pendingApr.id,
+            action: "approve",
+            token: rotatedToken,
+            ttlSeconds: 300
+        ))
+        let (getHTMLData, getCBResp) = try await URLSession.shared.data(from: URL(string: liveCallbackURL)!)
+        #expect((getCBResp as? HTTPURLResponse)?.statusCode == 200)
+        #expect(String(decoding: getHTMLData, as: UTF8.self).contains("<form method='POST'"))
+        #expect(orch.pendingApprovals().contains(where: { $0.id == pendingApr.id }) == true) // still pending after GET!
+
+        var postCBReq = URLRequest(url: URL(string: liveCallbackURL)!)
+        postCBReq.httpMethod = "POST"
+        postCBReq.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        postCBReq.httpBody = Data("comment=LGTM+remote".utf8)
+        let (_, postCBResp) = try await URLSession.shared.data(for: postCBReq)
+        #expect((postCBResp as? HTTPURLResponse)?.statusCode == 200)
+        #expect(orch.pendingApprovals().contains(where: { $0.id == pendingApr.id }) == false)
+
+        // Second POST replay on already-resolved approval returns 409 Conflict!
+        let (_, replayCBResp) = try await URLSession.shared.data(for: postCBReq)
+        #expect((replayCBResp as? HTTPURLResponse)?.statusCode == 409)
+
+        // 6. bianzhong://emit URL scheme CSRF guard + token auth + EventAuditRecord stage/search query
+        let untrustedDeepLink = URL(string: "bianzhong://emit?type=dev.bianzhong.url.emit&title=Untrusted&body=blocked")!
+        if case .requiresConfirmation = orch.handleIncomingURL(untrustedDeepLink) {
+            // Expected: mutating URL without token must require interactive user confirmation
+        } else {
+            Issue.record("Expected untrusted bianzhong://emit without token to require confirmation")
+        }
+        let wrongTokenLink = URL(string: "bianzhong://emit?type=dev.bianzhong.url.emit&title=Bad&token=wrong")!
+        #expect(orch.handleIncomingURL(wrongTokenLink) == .unauthorized)
+
+        let emitDeepLink = URL(string: "bianzhong://emit?type=dev.bianzhong.url.emit&title=Build%20Alert&body=raycast-trigger&token=\(rotatedToken)")!
+        if case .handled = orch.handleIncomingURL(emitDeepLink) {
+            // Expected
+        } else {
+            Issue.record("Expected token-authenticated bianzhong://emit to succeed immediately")
+        }
+
+        let audits = try orch.store.listEventAuditRecords(limit: 20, searchQuery: "raycast-trigger")
+        #expect(audits.count == 1)
+        #expect(audits.first?.matchedChimeID == "webhook-ci-watch")
+
+        // 7. Preferred terminal update persists via Orchestrator without losing comments
+        orch.setPreferredTerminal("ghostty")
+        #expect(orch.currentConfig().terminal == "ghostty")
+        #expect(AppConfig.load(from: paths.configFile).terminal == "ghostty")
+    }
+
+    @Test("24. v0.4.0 Code Review regressions: atomic approve CAS, HTML escaping, quote/sub-second round-trip, rule rename cleanup, SQL audit pushdown, and Git worktree prune")
+    func v040CodeReviewRegressions() async throws {
+        let shortID = String(UUID().uuidString.prefix(8))
+        let stateDir = URL(fileURLWithPath: "/tmp/bz-s24-\(shortID)", isDirectory: true)
+        let cfgDir = URL(fileURLWithPath: "/tmp/bz-c24-\(shortID)", isDirectory: true)
+        let repoDir = URL(fileURLWithPath: "/tmp/bz-r24-\(shortID)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: stateDir)
+            try? FileManager.default.removeItem(at: cfgDir)
+            try? FileManager.default.removeItem(at: repoDir)
+        }
+        let paths = BianzhongPaths(configDir: cfgDir, stateDir: stateDir)
+        try paths.ensureDirectories()
+
+        // (a) Lossless YAML quote/unescape & sub-second debounce round-trip across multiple saves + rename old-file cleanup
+        let trickyWhen = #"kind == "todo" && path == "C:\\repo\\a""#
+        let trickyCmd = #"printf "hello \"world\"\n""#
+        let ruleV1 = ChimeRule(
+            id: "alpha-rule",
+            description: #"Desc with "quotes" and \backslash"#,
+            matchTypes: ["dev.bianzhong.test"],
+            debounceSeconds: 0.5,
+            maxWaitSeconds: 2.5,
+            minCount: 1,
+            countWindow: .sliding(seconds: 3600),
+            countScope: .correlation,
+            countResetOnTrigger: false,
+            preflightCmd: trickyCmd,
+            onComplete: [
+                ActionSpec(type: .webhook, whenCondition: trickyWhen, preset: "feishu_bot", urlEnv: "WH_URL")
+            ],
+            phase1Prompt: "P1",
+            phase2Prompt: "P2"
+        )
+
+        var cfg = AppConfig(webhookServerEnabled: true, webhookHost: "127.0.0.1", webhookPort: 0)
+        try AppConfig.save(cfg, to: paths.configFile)
+        // Verify setTerminal preserves inline comments at top level
+        let commentedCfg = "# Header\nterminal: auto   # keep-terminal-comment\nwebhook_server:\n  enabled: true\n  port: 0\n"
+        try commentedCfg.write(to: paths.configFile, atomically: true, encoding: .utf8)
+        try AppConfig.setTerminal("warp", in: paths.configFile)
+        let afterTermText = try String(contentsOf: paths.configFile, encoding: .utf8)
+        #expect(afterTermText.contains("terminal: warp   # keep-terminal-comment"))
+        cfg = AppConfig.load(from: paths.configFile)
+        #expect(cfg.terminal == "warp")
+
+        let orch = try Orchestrator(paths: paths)
+        try orch.start(enableBuiltInSensors: false, enableWebhookServer: true)
+        defer { orch.stop() }
+
+        let saved1 = try orch.saveRule(ruleV1)
+        #expect(saved1.filePath?.hasSuffix("/alpha-rule.md") == true)
+        #expect(saved1.whenConditionCheck(expectedWhen: trickyWhen))
+        #expect(saved1.preflightCmd == trickyCmd)
+        #expect(saved1.description == #"Desc with "quotes" and \backslash"#)
+        #expect(abs(saved1.debounceSeconds - 0.5) < 0.001)
+        #expect(abs(saved1.maxWaitSeconds - 2.5) < 0.001)
+        #expect(saved1.countWindow == .sliding(seconds: 3600))
+        #expect(saved1.countScope == .correlation)
+        #expect(saved1.countResetOnTrigger == false)
+
+        // Save a second time + rename ID -> old file alpha-rule.md must be deleted, zero backslash inflation!
+        var renamed = saved1
+        renamed.id = "beta-rule"
+        let saved2 = try orch.saveRule(renamed)
+        #expect(saved2.id == "beta-rule")
+        #expect(FileManager.default.fileExists(atPath: paths.chimesDir.appendingPathComponent("alpha-rule.md").path) == false)
+        #expect(FileManager.default.fileExists(atPath: paths.chimesDir.appendingPathComponent("beta-rule.md").path) == true)
+        #expect(saved2.whenConditionCheck(expectedWhen: trickyWhen))
+        #expect(saved2.preflightCmd == trickyCmd)
+        #expect(orch.allRules().count == 1)
+
+        // (b) Concurrent atomic approve() CAS: 8 concurrent callers -> exactly 1 wins!
+        let casEvent = EventEnvelope(id: "ev-cas", source: "bz://test", type: "dev.bianzhong.test", correlationKey: "cas", payload: ["title": "CAS"])
+        try orch.store.recordEvent(casEvent, funnelStage: "dispatched", matchedChimeID: "beta-rule")
+        try orch.store.insertRun(id: "run-cas", eventID: casEvent.id, sessionID: nil, chimeID: "beta-rule", phase: "draft", driver: "none", status: "succeeded")
+        let xssTitleApproval = ApprovalRecord(
+            id: "apr-cas-1",
+            runID: "run-cas",
+            eventID: "ev-cas",
+            sessionID: nil,
+            chimeID: "beta-rule",
+            kind: "notify",
+            riskLevel: "low",
+            title: "<script>alert(1)</script>",
+            provenanceSummary: "test",
+            proposedAction: "noop",
+            targetRepo: nil,
+            externalSessionID: nil,
+            status: "pending",
+            userComment: nil,
+            createdAt: SQLiteStore.nowMs(),
+            resolvedAt: nil
+        )
+        try orch.store.insertApproval(xssTitleApproval)
+
+        // Verify HTML escaping on GET confirmation page before resolving
+        let tok = SecretStore.ensureWebhookToken(paths: paths)
+        let port = orch.webhookStatus().port
+        let cbURL = try #require(OutboundWebhookBuilder.signedApprovalURL(
+            baseURL: "http://127.0.0.1:\(port)",
+            approvalID: "apr-cas-1",
+            action: "approve",
+            token: tok
+        ))
+        let (htmlBytes, _) = try await URLSession.shared.data(from: URL(string: cbURL)!)
+        let htmlStr = String(decoding: htmlBytes, as: UTF8.self)
+        #expect(!htmlStr.contains("<script>alert(1)</script>"))
+        #expect(htmlStr.contains("&lt;script&gt;alert(1)&lt;/script&gt;"))
+
+        // Truncated Content-Length over raw TCP socket must return 400 Bad Request
+        let rawFD = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        #expect(rawFD >= 0)
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
+        let connRC = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(rawFD, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        #expect(connRC == 0)
+        let truncatedHTTP = Data("POST /v1/emit HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer \(tok)\r\nContent-Length: 500\r\n\r\n{\"a\":1}".utf8)
+        _ = truncatedHTTP.withUnsafeBytes { Darwin.write(rawFD, $0.baseAddress!, $0.count) }
+        Darwin.shutdown(rawFD, SHUT_WR) // EOF early while 493 bytes still missing!
+        var replyBuf = [UInt8](repeating: 0, count: 512)
+        let readN = Darwin.read(rawFD, &replyBuf, replyBuf.count)
+        Darwin.close(rawFD)
+        let replyText = readN > 0 ? String(decoding: replyBuf.prefix(readN), as: UTF8.self) : ""
+        #expect(replyText.contains("HTTP/1.1 400"))
+
+        let casWins = await withTaskGroup(of: Bool.self) { group -> Int in
+            for _ in 0..<8 {
+                group.addTask {
+                    orch.approve(id: "apr-cas-1", comment: "race")
+                }
+            }
+            var wins = 0
+            for await won in group where won { wins += 1 }
+            return wins
+        }
+        #expect(casWins == 1)
+
+        // (c) SQL pushdown in listEventAuditRecords finds older `dispatched` row buried beneath 240 `dropped_rule` rows
+        let targetEv = EventEnvelope(source: "bz://test", type: "dev.bianzhong.test", correlationKey: "needle", payload: ["title": "Needle Signal", "body": "deep_needle_100%"])
+        try orch.store.recordEvent(targetEv, funnelStage: "dispatched", matchedChimeID: "beta-rule")
+        for i in 0..<240 {
+            let noise = EventEnvelope(source: "bz://noise", type: "dev.bianzhong.noise", correlationKey: "n-\(i)", payload: ["title": "Noise \(i)"])
+            try orch.store.recordEvent(noise, funnelStage: "dropped_rule", dropReason: "no_chime_matched")
+        }
+        let dispatchedAudit = try orch.store.listEventAuditRecords(limit: 50, stageFilter: "dispatched")
+        #expect(dispatchedAudit.contains(where: { $0.id == targetEv.id }))
+        // Also verify literal `%` in searchQuery is properly escaped in LIKE ESCAPE '\'
+        let literalPercentHit = try orch.store.listEventAuditRecords(limit: 20, searchQuery: "deep_needle_100%")
+        #expect(literalPercentHit.count == 1)
+        let literalPercentMiss = try orch.store.listEventAuditRecords(limit: 20, searchQuery: "Noise %")
+        #expect(literalPercentMiss.isEmpty)
+
+        // (d) Clean Git worktree removal prunes `.git/worktrees/<name>` and enforces path boundary + dirty guard
+        try FileManager.default.createDirectory(at: repoDir, withIntermediateDirectories: true)
+        func git(_ dir: URL, _ args: [String]) throws {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            p.arguments = ["-C", dir.path] + args
+            p.standardOutput = Pipe()
+            p.standardError = Pipe()
+            try p.run()
+            p.waitUntilExit()
+            #expect(p.terminationStatus == 0)
+        }
+        try git(repoDir, ["init", "-q"])
+        try git(repoDir, ["config", "user.email", "test@bianzhong.dev"])
+        try git(repoDir, ["config", "user.name", "Bianzhong Test"])
+        try "hello\n".write(to: repoDir.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        try git(repoDir, ["add", "README.md"])
+        try git(repoDir, ["commit", "-q", "-m", "init"])
+
+        let wtPath = TerminalLauncher.prepareWorktreeIfGitRepo(repoPath: repoDir.path, runID: "wt24", worktreesDir: paths.worktreesDir)
+        #expect(wtPath != repoDir.path)
+        let wtMetaDir = repoDir.appendingPathComponent(".git/worktrees")
+        #expect(((try? FileManager.default.contentsOfDirectory(atPath: wtMetaDir.path)) ?? []).isEmpty == false)
+
+        // Out-of-bounds path rejected
+        #expect(throws: (any Error).self) {
+            try orch.removeWorktree(at: repoDir.path)
+        }
+
+        // Dirty worktree rejected unless cleaned
+        let dirtyFile = URL(fileURLWithPath: wtPath).appendingPathComponent("dirty.txt")
+        try "uncommitted".write(to: dirtyFile, atomically: true, encoding: .utf8)
+        #expect(throws: (any Error).self) {
+            try orch.removeWorktree(at: wtPath)
+        }
+        try FileManager.default.removeItem(at: dirtyFile)
+
+        // Clean worktree removed AND `.git/worktrees/<name>` metadata pruned from parent repo!
+        try orch.removeWorktree(at: wtPath)
+        #expect(FileManager.default.fileExists(atPath: wtPath) == false)
+        let remainingMeta = (try? FileManager.default.contentsOfDirectory(atPath: wtMetaDir.path)) ?? []
+        #expect(remainingMeta.isEmpty)
+    }
+}
+
+private extension ChimeRule {
+    func whenConditionCheck(expectedWhen: String) -> Bool {
+        onComplete.first?.whenCondition == expectedWhen
+    }
 }

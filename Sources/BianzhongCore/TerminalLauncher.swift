@@ -4,19 +4,46 @@ import Foundation
 /// Launches user-facing terminal takeover sessions (`omp -r` / `codex resume` / `bz config`)
 /// and handles safe clipboard copy + Feishu activation without self-triggering sensors.
 public enum TerminalLauncher {
-    public enum TerminalApp: String, Sendable {
+    public enum TerminalApp: String, CaseIterable, Codable, Sendable, Identifiable {
         case ghostty
         case iterm
         case warp
+        case kitty
+        case wezterm
+        case alacritty
+        case cmux
         case terminal
+
+        public var id: String { rawValue }
+
+        public var displayName: String {
+            switch self {
+            case .ghostty: return "Ghostty"
+            case .iterm: return "iTerm2"
+            case .warp: return "Warp"
+            case .kitty: return "Kitty"
+            case .wezterm: return "WezTerm"
+            case .alacritty: return "Alacritty"
+            case .cmux: return "cmux"
+            case .terminal: return "系统终端 (Terminal)"
+            }
+        }
 
         public var bundleIdentifier: String {
             switch self {
             case .ghostty: return "com.mitchellh.ghostty"
             case .iterm: return "com.googlecode.iterm2"
             case .warp: return "dev.warp.Warp-Stable"
+            case .kitty: return "net.kovidgoyal.kitty"
+            case .wezterm: return "com.github.wez.wezterm"
+            case .alacritty: return "org.alacritty"
+            case .cmux: return "com.cmuxterm.app"
             case .terminal: return "com.apple.Terminal"
             }
+        }
+
+        public var isInstalled: Bool {
+            NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) != nil
         }
     }
 
@@ -25,10 +52,14 @@ public enum TerminalLauncher {
         case "ghostty": return .ghostty
         case "iterm", "iterm2": return .iterm
         case "warp": return .warp
+        case "kitty": return .kitty
+        case "wezterm": return .wezterm
+        case "alacritty": return .alacritty
+        case "cmux": return .cmux
         case "terminal": return .terminal
         default:
-            for candidate in [TerminalApp.ghostty, .iterm, .warp, .terminal] {
-                if NSWorkspace.shared.urlForApplication(withBundleIdentifier: candidate.bundleIdentifier) != nil {
+            for candidate in TerminalApp.allCases {
+                if candidate.isInstalled {
                     return candidate
                 }
             }
@@ -66,6 +97,14 @@ public enum TerminalLauncher {
             try? FileManager.default.removeItem(at: scriptURL)
         }
         return launched
+    }
+
+    /// Opens an interactive shell rooted at `directory` in the user's preferred terminal.
+    @discardableResult
+    public static func openInteractiveShell(at directory: String, preferredTerminal: String = "auto") -> Bool {
+        let expanded = NSString(string: directory).expandingTildeInPath
+        let cmd = "cd \(shellQuote(expanded)) && clear && pwd && exec /bin/zsh -l"
+        return launchCommand(cmd, preferredTerminal: preferredTerminal)
     }
 
     private static func runOpenProcess(arguments: [String]) -> Bool {

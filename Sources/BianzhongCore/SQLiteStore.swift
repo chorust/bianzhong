@@ -55,6 +55,22 @@ public struct RejectedSample: Codable, Sendable, Equatable {
     public let createdAt: Int64
 }
 
+public struct EventAuditRecord: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let source: String
+    public let type: String
+    public let ts: String
+    public let receivedAt: Int64
+    public let correlationKey: String
+    public let title: String
+    public let subtitle: String
+    public let bodyPreview: String
+    public let funnelStage: String
+    public let matchedChimeID: String?
+    public let dropReason: String?
+    public let rawPayload: [String: String]
+}
+
 public enum SQLiteStoreError: Error, LocalizedError, Equatable {
     case openFailed(String)
     case prepareFailed(String)
@@ -765,6 +781,66 @@ public final class SQLiteStore: @unchecked Sendable {
         }
     }
 
+    /// Atomically transitions an unresolved (`pending` or `deferred`) approval to `status`.
+    /// Returns the original `ApprovalRecord` ONLY to the single caller that won the CAS update, or `nil` if missing/already resolved.
+    public func resolvePendingApprovalAtomically(id: String, status: String, comment: String?) throws -> ApprovalRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { throw SQLiteStoreError.openFailed("Database closed") }
+
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+            throw SQLiteStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        do {
+            let selectSQL = """
+            SELECT id, run_id, event_id, session_id, chime_id, kind, risk_level,
+                   title, provenance_summary, proposed_action, target_repo,
+                   external_session_id, status, user_comment, created_at, resolved_at
+            FROM approvals WHERE id = ? AND status IN ('pending', 'deferred') LIMIT 1;
+            """
+            var selStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, selectSQL, -1, &selStmt, nil) == SQLITE_OK else {
+                throw SQLiteStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            bindText(selStmt, 1, id)
+            let existing: ApprovalRecord? = (sqlite3_step(selStmt) == SQLITE_ROW) ? readApprovalRow(selStmt) : nil
+            sqlite3_finalize(selStmt)
+
+            guard let record = existing else {
+                sqlite3_exec(db, "COMMIT;", nil, nil, nil)
+                return nil
+            }
+
+            let updateSQL = """
+            UPDATE approvals
+            SET status = ?, user_comment = COALESCE(?, user_comment), resolved_at = ?
+            WHERE id = ? AND status IN ('pending', 'deferred');
+            """
+            var updStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, updateSQL, -1, &updStmt, nil) == SQLITE_OK else {
+                throw SQLiteStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            bindText(updStmt, 1, status)
+            bindOptionalText(updStmt, 2, comment)
+            sqlite3_bind_int64(updStmt, 3, Self.nowMs())
+            bindText(updStmt, 4, id)
+            let rc = sqlite3_step(updStmt)
+            sqlite3_finalize(updStmt)
+            guard rc == SQLITE_DONE else {
+                throw SQLiteStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            let changed = sqlite3_changes(db)
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                throw SQLiteStoreError.stepFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            return changed == 1 ? record : nil
+        } catch {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+    }
+
     public func listRecentRuns(limit: Int = 20) throws -> [RunRecord] {
         lock.lock()
         defer { lock.unlock() }
@@ -917,6 +993,109 @@ public final class SQLiteStore: @unchecked Sendable {
             )
         }
         return events
+    }
+
+    /// Queries the full event funnel audit log with SQL-level `WHERE` pushdown for stage & search filters.
+    public func listEventAuditRecords(
+        limit: Int = 120,
+        stageFilter: String? = nil,
+        searchQuery: String? = nil
+    ) throws -> [EventAuditRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { throw SQLiteStoreError.openFailed("Database closed") }
+
+        let qClean = searchQuery?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let stageClean = stageFilter?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        var clauses: [String] = []
+        var bindValues: [String] = []
+
+        if !stageClean.isEmpty && stageClean != "all" {
+            if stageClean == "dropped" {
+                clauses.append("(funnel_stage LIKE 'dropped_%' OR funnel_stage = 'l1_ignored')")
+            } else {
+                clauses.append("funnel_stage = ?")
+                bindValues.append(stageClean)
+            }
+        }
+
+        if !qClean.isEmpty {
+            let escaped = qClean
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "%", with: "\\%")
+                .replacingOccurrences(of: "_", with: "\\_")
+            let likePattern = "%\(escaped)%"
+            clauses.append("""
+            (LOWER(source) LIKE ? ESCAPE '\\'
+             OR LOWER(type) LIKE ? ESCAPE '\\'
+             OR LOWER(correlation_key) LIKE ? ESCAPE '\\'
+             OR LOWER(COALESCE(payload_summary, '')) LIKE ? ESCAPE '\\'
+             OR LOWER(COALESCE(matched_chime_id, '')) LIKE ? ESCAPE '\\'
+             OR LOWER(COALESCE(drop_reason, '')) LIKE ? ESCAPE '\\')
+            """)
+            for _ in 0..<6 {
+                bindValues.append(likePattern)
+            }
+        }
+
+        let whereSQL = clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND ")
+        let sql = """
+        SELECT id, source, type, ts, received_at, correlation_key, payload_summary,
+               funnel_stage, matched_chime_id, drop_reason
+        FROM events
+        \(whereSQL)
+        ORDER BY received_at DESC LIMIT ?;
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw SQLiteStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        for (i, val) in bindValues.enumerated() {
+            bindText(stmt, Int32(i + 1), val)
+        }
+        sqlite3_bind_int(stmt, Int32(bindValues.count + 1), Int32(max(1, limit)))
+
+        var records: [EventAuditRecord] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = columnText(stmt, 0) ?? ""
+            let source = columnText(stmt, 1) ?? ""
+            let type = columnText(stmt, 2) ?? ""
+            let ts = columnText(stmt, 3) ?? ""
+            let receivedAt = sqlite3_column_int64(stmt, 4)
+            let corr = columnText(stmt, 5) ?? ""
+            let payloadJSON = columnText(stmt, 6) ?? "{}"
+            let stage = columnText(stmt, 7) ?? ""
+            let matchedChime = columnText(stmt, 8)
+            let dropReason = columnText(stmt, 9)
+
+            let payload = (try? JSONDecoder().decode([String: String].self, from: Data(payloadJSON.utf8))) ?? [:]
+            let title = payload["title"] ?? payload["command"] ?? corr
+            let subtitle = payload["subtitle"] ?? ""
+            let body = payload["body"] ?? payload["summary"] ?? ""
+
+            records.append(
+                EventAuditRecord(
+                    id: id,
+                    source: source,
+                    type: type,
+                    ts: ts,
+                    receivedAt: receivedAt,
+                    correlationKey: corr,
+                    title: title,
+                    subtitle: subtitle,
+                    bodyPreview: String(body.prefix(300)),
+                    funnelStage: stage,
+                    matchedChimeID: matchedChime,
+                    dropReason: dropReason,
+                    rawPayload: payload
+                )
+            )
+        }
+        return records
     }
 
     public func recentTimeline(withinSeconds: Int = 1200, excludingEventID: String, limit: Int = 10) throws -> [TimelineEntry] {

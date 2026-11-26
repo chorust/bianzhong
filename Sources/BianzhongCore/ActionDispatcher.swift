@@ -135,10 +135,19 @@ public enum ActionConditionEvaluator {
 /// Executes declarative `on_complete` post-actions (`notify`, `webhook`, `shortcut`, `append_markdown`, `shell`, `clipboard`, `chime_sound`).
 public final class ActionDispatcher: @unchecked Sendable {
     private let funnel: WakeupFunnel
+    private let paths: BianzhongPaths
+    private let configProvider: @Sendable () -> AppConfig
     private let notifyHandler: @Sendable (ApprovalRecord) -> Void
 
-    public init(funnel: WakeupFunnel, notifyHandler: @escaping @Sendable (ApprovalRecord) -> Void) {
+    public init(
+        funnel: WakeupFunnel,
+        paths: BianzhongPaths = BianzhongPaths(),
+        configProvider: @escaping @Sendable () -> AppConfig = { AppConfig() },
+        notifyHandler: @escaping @Sendable (ApprovalRecord) -> Void
+    ) {
         self.funnel = funnel
+        self.paths = paths
+        self.configProvider = configProvider
         self.notifyHandler = notifyHandler
     }
 
@@ -172,7 +181,7 @@ public final class ActionDispatcher: @unchecked Sendable {
             guard let urlString = resolveWebhookURL(spec: spec), let url = URL(string: urlString) else {
                 return false
             }
-            return await postWebhook(url: url, title: title, text: text, context: context)
+            return await postWebhook(spec: spec, url: url, title: title, text: text, context: context)
 
         case .shortcut:
             guard let name = spec.name, !name.isEmpty else { return false }
@@ -250,32 +259,113 @@ public final class ActionDispatcher: @unchecked Sendable {
     private func resolveWebhookURL(spec: ActionSpec) -> String? {
         if let url = spec.url, !url.isEmpty { return url }
         if let envName = spec.urlEnv, !envName.isEmpty,
-           let val = ProcessInfo.processInfo.environment[envName], !val.isEmpty {
+           let val = SecretStore.resolve(envName, paths: paths), !val.isEmpty {
             return val
         }
         return nil
     }
 
-    private func postWebhook(url: URL, title: String, text: String, context: ActionContext) async -> Bool {
-        var req = URLRequest(url: url, timeoutInterval: 5.0)
+    private func postWebhook(spec: ActionSpec, url: URL, title: String, text: String, context: ActionContext) async -> Bool {
+        let preset = WebhookPreset(rawValue: (spec.preset ?? "raw").lowercased()) ?? .raw
+        let secret = spec.secretEnv.flatMap { SecretStore.resolve($0, paths: paths) }
+        let bearer = spec.tokenEnv.flatMap { SecretStore.resolve($0, paths: paths) }
+        let risk = context.approval?.riskLevel ?? (context.rule.worktreeOnPhase2 ? "medium" : "high")
+        let cfg = configProvider()
+        let serverToken = SecretStore.resolve(SecretStore.webhookTokenKey, paths: paths) ?? ""
+
+        var approveURL: String?
+        var rejectURL: String?
+        if let apr = context.approval, apr.kind != "notify", apr.kind != "digest",
+           let base = cfg.webhookCallbackBaseURL, !base.isEmpty, !serverToken.isEmpty {
+            approveURL = OutboundWebhookBuilder.signedApprovalURL(baseURL: base, approvalID: apr.id, action: "approve", token: serverToken)
+            rejectURL = OutboundWebhookBuilder.signedApprovalURL(baseURL: base, approvalID: apr.id, action: "reject", token: serverToken)
+        }
+
+        guard let built = try? OutboundWebhookBuilder.build(
+            preset: preset,
+            title: title,
+            text: text,
+            chimeID: context.rule.id,
+            phase: context.phase,
+            riskLevel: risk,
+            correlationKey: context.event.correlationKey,
+            sessionID: context.sessionID,
+            approvalID: context.approval?.id,
+            secret: secret,
+            bearerToken: bearer,
+            chatID: spec.chatID,
+            approveCallbackURL: approveURL,
+            rejectCallbackURL: rejectURL
+        ) else {
+            return false
+        }
+
+        var req = URLRequest(url: url, timeoutInterval: 6.0)
         req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let payload: [String: String] = [
-            "title": title,
-            "body": text,
-            "text": "\(title)\n\(text)",
-            "chime_id": context.rule.id,
-            "phase": context.phase,
-            "correlation_key": context.event.correlationKey,
-            "session_id": context.sessionID ?? ""
-        ]
-        guard let body = try? JSONEncoder().encode(payload) else { return false }
-        req.httpBody = body
+        for (hKey, hVal) in built.headers {
+            req.setValue(hVal, forHTTPHeaderField: hKey)
+        }
+        req.httpBody = built.body
         do {
             let (_, resp) = try await URLSession.shared.data(for: req)
             return (resp as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
         } catch {
             return false
+        }
+    }
+
+    /// Sends a one-shot test outbound webhook directly from the Unified Settings Console.
+    public static func sendTestOutboundWebhook(
+        preset: WebhookPreset,
+        urlString: String,
+        secretEnvOrRaw: String?,
+        tokenEnvOrRaw: String?,
+        chatID: String?,
+        paths: BianzhongPaths = BianzhongPaths()
+    ) async -> (ok: Bool, message: String) {
+        guard let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return (false, "无效的 Webhook URL")
+        }
+        let resolvedSecret: String? = secretEnvOrRaw.flatMap { (key: String) -> String? in
+            let t = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            if t.isEmpty { return nil }
+            return SecretStore.resolve(t, paths: paths) ?? t
+        }
+        let resolvedToken: String? = tokenEnvOrRaw.flatMap { (key: String) -> String? in
+            let t = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            if t.isEmpty { return nil }
+            return SecretStore.resolve(t, paths: paths) ?? t
+        }
+        do {
+            let built = try OutboundWebhookBuilder.build(
+                preset: preset,
+                title: "Bianzhong 出站连通性测试",
+                text: "这是一条来自编钟（Bianzhong）统一设置面板的测试消息。",
+                chimeID: "webhook-test",
+                phase: "test",
+                riskLevel: "low",
+                correlationKey: "test:outbound",
+                sessionID: nil,
+                approvalID: nil,
+                secret: resolvedSecret,
+                bearerToken: resolvedToken,
+                chatID: chatID
+            )
+            var req = URLRequest(url: url, timeoutInterval: 8.0)
+            req.httpMethod = "POST"
+            for (k, v) in built.headers {
+                req.setValue(v, forHTTPHeaderField: k)
+            }
+            req.httpBody = built.body
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let preview = String(data: data.prefix(200), encoding: .utf8) ?? ""
+            if (200..<300).contains(code) {
+                return (true, "HTTP \(code) 发送成功 \(preview.isEmpty ? "" : "· \(preview)")")
+            }
+            return (false, "HTTP \(code) 返回非 2xx：\(preview)")
+        } catch {
+            return (false, "请求失败：\(error.localizedDescription)")
         }
     }
 

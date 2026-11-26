@@ -79,18 +79,25 @@ public struct DecisionAPITriageProvider: TriageProvider {
     private let endpoint: URL
     private let tokenEnvVar: String
     private let timeoutSeconds: TimeInterval
+    private let paths: BianzhongPaths
 
-    public init(endpoint: URL, tokenEnvVar: String = "BIANZHONG_DECISION_API_KEY", timeoutSeconds: TimeInterval = 4.0) {
+    public init(
+        endpoint: URL,
+        tokenEnvVar: String = "BIANZHONG_DECISION_API_KEY",
+        timeoutSeconds: TimeInterval = 4.0,
+        paths: BianzhongPaths = BianzhongPaths()
+    ) {
         self.endpoint = endpoint
         self.tokenEnvVar = tokenEnvVar
         self.timeoutSeconds = timeoutSeconds
+        self.paths = paths
     }
 
     public func classify(request: TriageRequest) async -> TriageDecision {
         var urlRequest = URLRequest(url: endpoint, timeoutInterval: timeoutSeconds)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let token = ProcessInfo.processInfo.environment[tokenEnvVar], !token.isEmpty {
+        if let token = SecretStore.resolve(tokenEnvVar, paths: paths), !token.isEmpty {
             urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
@@ -206,7 +213,7 @@ public struct AppleFMTriageProvider: TriageProvider {
 }
 
 public enum TriageProviderFactory {
-    public static func make(config: AppConfig, override: String?) -> any TriageProvider {
+    public static func make(config: AppConfig, override: String?, paths: BianzhongPaths = BianzhongPaths()) -> any TriageProvider {
         let choice = (override ?? config.triageProvider).lowercased()
         switch choice {
         case "decision_api", "jev":
@@ -214,7 +221,8 @@ public enum TriageProviderFactory {
                 return DecisionAPITriageProvider(
                     endpoint: url,
                     tokenEnvVar: config.decisionAPIKeyEnv,
-                    timeoutSeconds: config.decisionAPITimeoutSeconds
+                    timeoutSeconds: config.decisionAPITimeoutSeconds,
+                    paths: paths
                 )
             }
             return PassThroughTriageProvider()

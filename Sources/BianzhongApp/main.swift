@@ -6,7 +6,7 @@ if CommandLine.arguments.contains("--daemon") || CommandLine.arguments.contains(
     _ = try? DefaultTemplates.installDefaultsIfMissing(paths: paths)
     CLIIntegration.autoInstallOnLaunchIfEligible()
     let orch = try Orchestrator(paths: paths)
-    try orch.start(enableBuiltInSensors: true)
+    try orch.start(enableBuiltInSensors: true, enableWebhookServer: true)
     fputs("Bianzhong daemon listening on \(paths.socketURL.path)\n", stderr)
     RunLoop.main.run()
 } else {

@@ -213,6 +213,7 @@ public struct BianzhongPaths: Sendable {
     public var sessionsDir: URL { stateDir.appendingPathComponent("sessions", isDirectory: true) }
     public var worktreesDir: URL { stateDir.appendingPathComponent("worktrees", isDirectory: true) }
     public var feishuCursorURL: URL { stateDir.appendingPathComponent("feishu_sensor_cursor.txt") }
+    public var secretsFile: URL { stateDir.appendingPathComponent("secrets.json") }
 
     public func ensureDirectories() throws {
         let fm = FileManager.default

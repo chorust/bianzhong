@@ -81,7 +81,7 @@ public final class RuntimeGovernance: @unchecked Sendable {
                 guard mtime < cutoffDate else { continue }
                 if isWorktreeDirty(at: item.path) {
                     dirtyWorktrees.append(item.path)
-                } else if (try? fm.removeItem(at: item)) != nil {
+                } else if Self.detachAndRemoveWorktreeDir(at: item.path) {
                     removedWorktrees += 1
                 }
             }
@@ -93,6 +93,55 @@ public final class RuntimeGovernance: @unchecked Sendable {
             removedWorktrees: removedWorktrees,
             preservedDirtyWorktrees: dirtyWorktrees
         )
+    }
+
+    /// Cleanly detaches a Git worktree from its parent `.git/worktrees/<name>` metadata before deleting its folder.
+    @discardableResult
+    public static func detachAndRemoveWorktreeDir(at path: String) -> Bool {
+        let fm = FileManager.default
+        let gitCommonDir = resolveGitCommonDir(forWorktree: path)
+
+        if let common = gitCommonDir {
+            let rmProc = Process()
+            rmProc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            rmProc.arguments = ["--git-dir=\(common)", "worktree", "remove", path]
+            rmProc.standardOutput = Pipe()
+            rmProc.standardError = Pipe()
+            if (try? rmProc.run()) != nil {
+                rmProc.waitUntilExit()
+                if rmProc.terminationStatus == 0 && !fm.fileExists(atPath: path) {
+                    return true
+                }
+            }
+        }
+
+        let removed = (try? fm.removeItem(atPath: path)) != nil
+        if let common = gitCommonDir {
+            let pruneProc = Process()
+            pruneProc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            pruneProc.arguments = ["--git-dir=\(common)", "worktree", "prune"]
+            pruneProc.standardOutput = Pipe()
+            pruneProc.standardError = Pipe()
+            if (try? pruneProc.run()) != nil {
+                pruneProc.waitUntilExit()
+            }
+        }
+        return removed
+    }
+
+    private static func resolveGitCommonDir(forWorktree path: String) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        proc.arguments = ["-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        guard (try? proc.run()) != nil else { return nil }
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        let raw = (String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? nil : raw
     }
 
     private func pruneDirectory(_ dir: URL, olderThan cutoff: Date) -> Int {

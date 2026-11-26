@@ -95,8 +95,12 @@ public enum ActionType: String, Codable, Sendable, Equatable {
 public struct ActionSpec: Codable, Sendable, Equatable {
     public var type: ActionType
     public var whenCondition: String?
+    public var preset: String?
     public var url: String?
     public var urlEnv: String?
+    public var secretEnv: String?
+    public var tokenEnv: String?
+    public var chatID: String?
     public var path: String?
     public var name: String?
     public var command: String?
@@ -106,8 +110,12 @@ public struct ActionSpec: Codable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey {
         case type
         case whenCondition = "when"
+        case preset
         case url
         case urlEnv = "url_env"
+        case secretEnv = "secret_env"
+        case tokenEnv = "token_env"
+        case chatID = "chat_id"
         case path
         case name
         case command = "cmd"
@@ -118,8 +126,12 @@ public struct ActionSpec: Codable, Sendable, Equatable {
     public init(
         type: ActionType,
         whenCondition: String? = nil,
+        preset: String? = nil,
         url: String? = nil,
         urlEnv: String? = nil,
+        secretEnv: String? = nil,
+        tokenEnv: String? = nil,
+        chatID: String? = nil,
         path: String? = nil,
         name: String? = nil,
         command: String? = nil,
@@ -128,8 +140,12 @@ public struct ActionSpec: Codable, Sendable, Equatable {
     ) {
         self.type = type
         self.whenCondition = whenCondition
+        self.preset = preset
         self.url = url
         self.urlEnv = urlEnv
+        self.secretEnv = secretEnv
+        self.tokenEnv = tokenEnv
+        self.chatID = chatID
         self.path = path
         self.name = name
         self.command = command
@@ -148,6 +164,10 @@ public struct AppConfig: Sendable, Equatable {
     public var agentCLIModel: String?
     public var terminal: String
     public var feishuSensorEnabled: Bool
+    public var webhookServerEnabled: Bool
+    public var webhookHost: String
+    public var webhookPort: Int
+    public var webhookCallbackBaseURL: String?
     public var maxConcurrentRuns: Int
     public var maxCausalDepth: Int
     public var dailyMaxCostUSD: Double
@@ -165,6 +185,10 @@ public struct AppConfig: Sendable, Equatable {
         agentCLIModel: String? = "smol",
         terminal: String = "auto",
         feishuSensorEnabled: Bool = true,
+        webhookServerEnabled: Bool = true,
+        webhookHost: String = "127.0.0.1",
+        webhookPort: Int = 17380,
+        webhookCallbackBaseURL: String? = nil,
         maxConcurrentRuns: Int = 2,
         maxCausalDepth: Int = 1,
         dailyMaxCostUSD: Double = 3.0,
@@ -181,6 +205,10 @@ public struct AppConfig: Sendable, Equatable {
         self.agentCLIModel = agentCLIModel
         self.terminal = terminal
         self.feishuSensorEnabled = feishuSensorEnabled
+        self.webhookServerEnabled = webhookServerEnabled
+        self.webhookHost = webhookHost
+        self.webhookPort = webhookPort
+        self.webhookCallbackBaseURL = webhookCallbackBaseURL
         self.maxConcurrentRuns = maxConcurrentRuns
         self.maxCausalDepth = maxCausalDepth
         self.dailyMaxCostUSD = dailyMaxCostUSD
@@ -247,6 +275,8 @@ public struct AppConfig: Sendable, Equatable {
                 switch section {
                 case "triage":
                     applyTriage(k, v, to: &config)
+                case "webhook_server", "webhook":
+                    applyWebhookServer(k, v, to: &config)
                 case "governance":
                     applyGlobal(k, v, to: &config)
                 default:
@@ -264,6 +294,10 @@ public struct AppConfig: Sendable, Equatable {
         switch key {
         case "terminal": config.terminal = val
         case "feishu_sensor_enabled": config.feishuSensorEnabled = parseBool(val, default: config.feishuSensorEnabled)
+        case "webhook_server_enabled": config.webhookServerEnabled = parseBool(val, default: config.webhookServerEnabled)
+        case "webhook_host": config.webhookHost = val.isEmpty ? config.webhookHost : val
+        case "webhook_port": config.webhookPort = max(0, min(65535, Int(val) ?? config.webhookPort))
+        case "webhook_callback_base_url": config.webhookCallbackBaseURL = (val.isEmpty || val == "null") ? nil : val
         case "max_concurrent_runs": config.maxConcurrentRuns = max(1, Int(val) ?? config.maxConcurrentRuns)
         case "max_causal_depth": config.maxCausalDepth = max(1, Int(val) ?? config.maxCausalDepth)
         case "daily_max_cost_usd": config.dailyMaxCostUSD = max(0, Double(val) ?? config.dailyMaxCostUSD)
@@ -274,8 +308,79 @@ public struct AppConfig: Sendable, Equatable {
         }
     }
 
+    private static func applyWebhookServer(_ key: String, _ value: String, to config: inout AppConfig) {
+        let val = unquote(value)
+        switch key {
+        case "enabled": config.webhookServerEnabled = parseBool(val, default: config.webhookServerEnabled)
+        case "host", "bind_host": config.webhookHost = val.isEmpty ? config.webhookHost : val
+        case "port": config.webhookPort = max(0, min(65535, Int(val) ?? config.webhookPort))
+        case "callback_base_url": config.webhookCallbackBaseURL = (val.isEmpty || val == "null") ? nil : val
+        default: break
+        }
+    }
+
+    /// Serializes and writes the complete `AppConfig` cleanly to `~/.config/bianzhong/config.yml`.
+    public static func save(_ config: AppConfig, to configFile: URL) throws {
+        var out: [String] = [
+            "# Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)",
+            "terminal: \(yamlScalar(config.terminal))",
+            "feishu_sensor_enabled: \(config.feishuSensorEnabled)",
+            "max_concurrent_runs: \(config.maxConcurrentRuns)",
+            "max_causal_depth: \(config.maxCausalDepth)",
+            "",
+            "# 入站 HTTP Webhook 网关（默认仅监听本机 127.0.0.1，Bearer Token 存于安全密钥库）",
+            "webhook_server:",
+            "  enabled: \(config.webhookServerEnabled)",
+            "  host: \(yamlScalar(config.webhookHost))",
+            "  port: \(config.webhookPort)",
+            "  callback_base_url: \(config.webhookCallbackBaseURL.map(yamlScalar) ?? "null")",
+            "",
+            "# 全局预算、熔断与自动清理治理",
+            "governance:",
+            "  daily_max_cost_usd: \(String(format: "%.2f", config.dailyMaxCostUSD))",
+            "  daily_max_runs: \(config.dailyMaxRuns)",
+            "  circuit_breaker_failures: \(config.circuitBreakerFailures)",
+            "  retention_days: \(config.retentionDays)",
+            "",
+            "# L1 语义分诊器（当 chime 启用 triage 时生效）",
+            "triage:",
+            "  provider: \(yamlScalar(config.triageProvider))",
+            "  decision_api_url: \(config.decisionAPIURL.map(yamlScalar) ?? "null")",
+            "  decision_api_key_env: \(yamlScalar(config.decisionAPIKeyEnv))",
+            "  decision_api_timeout_seconds: \(String(format: "%.1f", config.decisionAPITimeoutSeconds))",
+            "  agent_cli_driver: \(yamlScalar(config.agentCLIDriver))",
+            "  agent_cli_model: \(config.agentCLIModel.map(yamlScalar) ?? "null")",
+            ""
+        ]
+
+        if config.workspaces.isEmpty {
+            out.append("workspaces: []")
+        } else {
+            out.append("# 候选本地工作区目录（供 L1 语义分诊或规则参考）")
+            out.append("workspaces:")
+            for ws in config.workspaces {
+                out.append("  - name: \(yamlScalar(ws.name))")
+                out.append("    path: \(yamlScalar(ws.path))")
+                out.append("    summary: \(yamlQuote(ws.summary))")
+            }
+        }
+        out.append("")
+
+        try FileManager.default.createDirectory(at: configFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try out.joined(separator: "\n").write(to: configFile, atomically: true, encoding: .utf8)
+    }
+
+    /// Updates or inserts `terminal` at top level inside `config.yml` without disturbing nested keys or comments.
+    public static func setTerminal(_ terminal: String, in configFile: URL) throws {
+        try setTopLevelScalar(key: "terminal", renderedValue: yamlScalar(terminal), in: configFile)
+    }
+
     /// Updates or inserts `feishu_sensor_enabled` at top level inside `config.yml` without disturbing nested keys or comments.
     public static func setFeishuSensorEnabled(_ enabled: Bool, in configFile: URL) throws {
+        try setTopLevelScalar(key: "feishu_sensor_enabled", renderedValue: "\(enabled)", in: configFile)
+    }
+
+    private static func setTopLevelScalar(key: String, renderedValue: String, in configFile: URL) throws {
         let existing = (try? String(contentsOf: configFile, encoding: .utf8)) ?? ""
         var lines = splitLines(existing)
         var replaced = false
@@ -284,13 +389,13 @@ public struct AppConfig: Sendable, Equatable {
             let isTopLevel = line.prefix { $0 == " " || $0 == "\t" }.isEmpty
             guard isTopLevel,
                   let (k, _) = splitKeyValue(stripComment(line)),
-                  k == "feishu_sensor_enabled" else {
+                  k == key else {
                 continue
             }
             if let hashIdx = line.firstIndex(of: "#") {
-                lines[idx] = "feishu_sensor_enabled: \(enabled)   \(line[hashIdx...])"
+                lines[idx] = "\(key): \(renderedValue)   \(line[hashIdx...])"
             } else {
-                lines[idx] = "feishu_sensor_enabled: \(enabled)"
+                lines[idx] = "\(key): \(renderedValue)"
             }
             replaced = true
             break
@@ -300,9 +405,9 @@ public struct AppConfig: Sendable, Equatable {
                 let t = line.trimmingCharacters(in: .whitespaces)
                 return !t.isEmpty && !t.hasPrefix("#")
             }) {
-                lines.insert("feishu_sensor_enabled: \(enabled)", at: firstNonComment)
+                lines.insert("\(key): \(renderedValue)", at: firstNonComment)
             } else {
-                lines.append("feishu_sensor_enabled: \(enabled)")
+                lines.append("\(key): \(renderedValue)")
             }
         }
         try FileManager.default.createDirectory(at: configFile.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -670,8 +775,12 @@ public struct ChimeRule: Sendable, Equatable, Identifiable {
             guard currentAction != nil else { return }
             switch key {
             case "when": currentAction?.whenCondition = (val.isEmpty || val == "null") ? nil : val
+            case "preset": currentAction?.preset = (val.isEmpty || val == "null") ? nil : val
             case "url": currentAction?.url = (val.isEmpty || val == "null") ? nil : val
             case "url_env": currentAction?.urlEnv = (val.isEmpty || val == "null") ? nil : val
+            case "secret_env": currentAction?.secretEnv = (val.isEmpty || val == "null") ? nil : val
+            case "token_env": currentAction?.tokenEnv = (val.isEmpty || val == "null") ? nil : val
+            case "chat_id": currentAction?.chatID = (val.isEmpty || val == "null") ? nil : val
             case "path": currentAction?.path = (val.isEmpty || val == "null") ? nil : expandTilde(val)
             case "name": currentAction?.name = (val.isEmpty || val == "null") ? nil : val
             case "cmd", "command": currentAction?.command = (val.isEmpty || val == "null") ? nil : val
@@ -910,6 +1019,183 @@ public struct ChimeRule: Sendable, Equatable, Identifiable {
         let p2 = phase2.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         return (p1, p2)
     }
+
+    /// Serializes this `ChimeRule` into canonical Markdown + YAML Frontmatter format (`chimes/*.md`).
+    public func serializeToMarkdown() -> String {
+        var lines: [String] = [
+            "---",
+            "id: \(yamlScalar(id))",
+            "enabled: \(enabled)",
+            "description: \(yamlQuote(description))",
+            "",
+            "match:",
+            "  type: \(yamlArray(matchTypes))",
+            "  source: \(yamlArray(matchSources))"
+        ]
+        if !titleEquals.isEmpty { lines.append("  title_equals: \(yamlArray(titleEquals))") }
+        if !titleAny.isEmpty { lines.append("  title_any: \(yamlArray(titleAny))") }
+        if !titleAll.isEmpty { lines.append("  title_all: \(yamlArray(titleAll))") }
+        if !titleExclude.isEmpty { lines.append("  title_exclude: \(yamlArray(titleExclude))") }
+        if !subtitleEquals.isEmpty { lines.append("  subtitle_equals: \(yamlArray(subtitleEquals))") }
+        if !subtitleAny.isEmpty { lines.append("  subtitle_any: \(yamlArray(subtitleAny))") }
+        if !subtitleAll.isEmpty { lines.append("  subtitle_all: \(yamlArray(subtitleAll))") }
+        if !subtitleExclude.isEmpty { lines.append("  subtitle_exclude: \(yamlArray(subtitleExclude))") }
+        if !bodyAny.isEmpty { lines.append("  body_any: \(yamlArray(bodyAny))") }
+        if !bodyAll.isEmpty { lines.append("  body_all: \(yamlArray(bodyAll))") }
+        if !bodyExclude.isEmpty { lines.append("  body_exclude: \(yamlArray(bodyExclude))") }
+        if !cwdPrefix.isEmpty { lines.append("  cwd_prefix: \(yamlArray(cwdPrefix))") }
+        lines.append("  keywords_any: \(yamlArray(keywordsAny))")
+        if !keywordsAll.isEmpty { lines.append("  keywords_all: \(yamlArray(keywordsAll))") }
+        lines.append("  exclude_keywords: \(yamlArray(excludeKeywords))")
+
+        let windowLiteral: String
+        switch countWindow {
+        case .daily: windowLiteral = "daily"
+        case .sliding(let sec):
+            if sec % 3600 == 0 { windowLiteral = "\(sec / 3600)h" }
+            else if sec % 60 == 0 { windowLiteral = "\(sec / 60)m" }
+            else { windowLiteral = "\(sec)s" }
+        }
+
+        lines += [
+            "",
+            "funnel:",
+            "  dedup_ttl: \(dedupTTLSeconds)s",
+            "  debounce: \(formatDurationSeconds(debounceSeconds))",
+            "  max_wait: \(formatDurationSeconds(maxWaitSeconds))",
+            "  cooldown: \(cooldownSeconds)s"
+        ]
+        if minCount > 1 || countWindow != .daily || countScope != .rule || !countResetOnTrigger {
+            lines.append("  min_count: \(minCount)")
+            lines.append("  window: \(windowLiteral)")
+            lines.append("  count_scope: \(countScope.rawValue)")
+            lines.append("  count_reset_on_trigger: \(countResetOnTrigger)")
+        }
+        lines += [
+            "  defer_on_focus: \(deferOnFocus)",
+            "  triage:",
+            "    enabled: \(triageEnabled)",
+            "    provider: \(triageProviderOverride.map(yamlScalar) ?? "none")"
+        ]
+
+        if let exp = expectWindow {
+            let wdNames: [String] = exp.weekdays.compactMap { wd in
+                switch wd {
+                case 1: return "mon"
+                case 2: return "tue"
+                case 3: return "wed"
+                case 4: return "thu"
+                case 5: return "fri"
+                case 6: return "sat"
+                case 7: return "sun"
+                default: return nil
+                }
+            }
+            lines += [
+                "",
+                "expect:",
+                "  enabled: \(exp.enabled)",
+                "  window: \(yamlQuote("\(exp.windowStart)-\(exp.windowEnd)"))",
+                "  weekdays: \(yamlArray(wdNames))",
+                "  suppress_on_match: \(exp.suppressOnMatch)",
+                "  grace_seconds: \(exp.graceSeconds)"
+            ]
+        }
+
+        lines += [
+            "",
+            "session:",
+            "  policy: \(sessionPolicy.rawValue)",
+            "  ttl: \(sessionTTLSeconds)s",
+            "",
+            "execution:",
+            "  autonomy: \(autonomy.rawValue)",
+            "  driver: \(yamlScalar(driver))",
+            "  model: \(model.map(yamlScalar) ?? "null")",
+            "  working_dir: \(yamlScalar(workingDir))",
+            "  worktree_on_phase2: \(worktreeOnPhase2)"
+        ]
+        if let cmd = preflightCmd, !cmd.isEmpty {
+            lines.append("  preflight_cmd: \(yamlQuote(cmd))")
+            lines.append("  preflight_timeout_sec: \(preflightTimeoutSeconds)")
+        }
+        lines += [
+            "  phase1_max_time_sec: \(phase1MaxTimeSeconds)",
+            "  phase1_max_cost_usd: \(String(format: "%.2f", phase1MaxCostUSD))",
+            "  phase2_max_time_sec: \(phase2MaxTimeSeconds)",
+            "  phase2_max_cost_usd: \(String(format: "%.2f", phase2MaxCostUSD))"
+        ]
+
+        lines.append("")
+        if onComplete.isEmpty {
+            lines.append("on_complete: []")
+        } else {
+            lines.append("on_complete:")
+            for act in onComplete {
+                lines.append("  - type: \(act.type.rawValue)")
+                if let w = act.whenCondition, !w.isEmpty { lines.append("    when: \(yamlQuote(w))") }
+                if let p = act.preset, !p.isEmpty { lines.append("    preset: \(yamlScalar(p))") }
+                if let u = act.url, !u.isEmpty { lines.append("    url: \(yamlQuote(u))") }
+                if let ue = act.urlEnv, !ue.isEmpty { lines.append("    url_env: \(yamlScalar(ue))") }
+                if let se = act.secretEnv, !se.isEmpty { lines.append("    secret_env: \(yamlScalar(se))") }
+                if let te = act.tokenEnv, !te.isEmpty { lines.append("    token_env: \(yamlScalar(te))") }
+                if let cid = act.chatID, !cid.isEmpty { lines.append("    chat_id: \(yamlQuote(cid))") }
+                if let pa = act.path, !pa.isEmpty { lines.append("    path: \(yamlQuote(pa))") }
+                if let na = act.name, !na.isEmpty { lines.append("    name: \(yamlQuote(na))") }
+                if let cm = act.command, !cm.isEmpty { lines.append("    cmd: \(yamlQuote(cm))") }
+                if let tp = act.template, !tp.isEmpty { lines.append("    template: \(yamlQuote(tp))") }
+                if act.tts { lines.append("    tts: true") }
+            }
+        }
+
+        lines.append("---")
+        lines.append("")
+        lines.append("## Phase 1")
+        lines.append(phase1Prompt.isEmpty ? "请只读排查此信号并输出精炼结论。" : phase1Prompt)
+        if !phase2Prompt.isEmpty {
+            lines.append("")
+            lines.append("## Phase 2")
+            lines.append(phase2Prompt)
+        }
+        lines.append("")
+        return lines.joined(separator: "\n")
+    }
+
+    public func save(to fileURL: URL) throws {
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try serializeToMarkdown().write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+}
+
+private func formatDurationSeconds(_ val: Double) -> String {
+    if val == val.rounded() {
+        return "\(Int(val))s"
+    }
+    return "\(String(format: "%g", val))s"
+}
+
+private func yamlQuote(_ raw: String) -> String {
+    let escaped = raw
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "\r", with: "\\r")
+        .replacingOccurrences(of: "\n", with: "\\n")
+        .replacingOccurrences(of: "\t", with: "\\t")
+    return "\"\(escaped)\""
+}
+
+private func yamlScalar(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty { return "\"\"" }
+    if trimmed.contains(":") || trimmed.contains("#") || trimmed.contains(" ") || trimmed.hasPrefix("$") {
+        return yamlQuote(trimmed)
+    }
+    return trimmed
+}
+
+private func yamlArray(_ items: [String]) -> String {
+    if items.isEmpty { return "[]" }
+    return "[" + items.map(yamlQuote).joined(separator: ", ") + "]"
 }
 
 // MARK: - Lightweight YAML Parsing Helpers
@@ -947,10 +1233,35 @@ private func splitKeyValue(_ line: String) -> (String, String)? {
 
 private func unquote(_ raw: String) -> String {
     let trimmed = raw.trimmingCharacters(in: .whitespaces)
-    if (trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"")) || (trimmed.hasPrefix("'") && trimmed.hasSuffix("'")) {
-        if trimmed.count >= 2 {
-            return String(trimmed.dropFirst().dropLast())
+    if trimmed.count >= 2, trimmed.hasPrefix("\""), trimmed.hasSuffix("\"") {
+        let inner = String(trimmed.dropFirst().dropLast())
+        var out = ""
+        out.reserveCapacity(inner.count)
+        var escaping = false
+        for ch in inner {
+            if escaping {
+                switch ch {
+                case "\"": out.append("\"")
+                case "\\": out.append("\\")
+                case "n": out.append("\n")
+                case "r": out.append("\r")
+                case "t": out.append("\t")
+                default:
+                    out.append("\\")
+                    out.append(ch)
+                }
+                escaping = false
+            } else if ch == "\\" {
+                escaping = true
+            } else {
+                out.append(ch)
+            }
         }
+        if escaping { out.append("\\") }
+        return out
+    }
+    if trimmed.count >= 2, trimmed.hasPrefix("'"), trimmed.hasSuffix("'") {
+        return String(trimmed.dropFirst().dropLast()).replacingOccurrences(of: "''", with: "'")
     }
     return trimmed
 }

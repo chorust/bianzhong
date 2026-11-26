@@ -12,6 +12,46 @@ private struct RunContextBundle: Codable {
     }
 }
 
+public struct ManagedWorktreeInfo: Sendable, Equatable, Identifiable {
+    public var id: String { path }
+    public let name: String
+    public let path: String
+    public let branch: String
+    public let isDirty: Bool
+    public let modifiedAt: Date
+
+    public init(name: String, path: String, branch: String, isDirty: Bool, modifiedAt: Date) {
+        self.name = name
+        self.path = path
+        self.branch = branch
+        self.isDirty = isDirty
+        self.modifiedAt = modifiedAt
+    }
+}
+
+public struct WebhookStatusInfo: Sendable, Equatable {
+    public let enabled: Bool
+    public let running: Bool
+    public let host: String
+    public let port: UInt16
+    public let errorMessage: String?
+
+    public init(enabled: Bool, running: Bool, host: String, port: UInt16, errorMessage: String?) {
+        self.enabled = enabled
+        self.running = running
+        self.host = host
+        self.port = port
+        self.errorMessage = errorMessage
+    }
+}
+
+public enum IncomingURLOutcome: Equatable, Sendable {
+    case handled(BianzhongURLAction)
+    case requiresConfirmation(BianzhongURLAction)
+    case unauthorized
+    case invalidURL
+}
+
 public struct OrchestratorCallbacks: Sendable {
     public var onApprovalUpdated: @Sendable () -> Void
     public var onNotifyApproval: @Sendable (ApprovalRecord) -> Void
@@ -91,6 +131,9 @@ public final class Orchestrator: @unchecked Sendable {
 
     private var config: AppConfig
     private var bus: SocketBus?
+    private var webhookServer: WebhookServer?
+    private var webhookServerSubsystemEnabled = false
+    private var webhookServerError: String?
     private var feishuMonitor: FeishuSensorMonitor?
     private var builtInSensorsEnabled = false
     private var customFeishuDBURL: URL?
@@ -104,23 +147,37 @@ public final class Orchestrator: @unchecked Sendable {
     public init(paths: BianzhongPaths = BianzhongPaths(), callbacks: OrchestratorCallbacks = OrchestratorCallbacks()) throws {
         self.paths = paths
         try paths.ensureDirectories()
-        self.config = AppConfig.load(from: paths.configFile)
+        _ = SecretStore.ensureWebhookToken(paths: paths)
+        let initialConfig = AppConfig.load(from: paths.configFile)
+        self.config = initialConfig
         self.store = try SQLiteStore(dbURL: paths.dbURL)
         let loadedRules = ChimeRule.loadAll(from: paths.chimesDir)
         let funnelInstance = WakeupFunnel(
             store: store,
             rules: loadedRules,
-            maxCausalDepth: config.maxCausalDepth
+            maxCausalDepth: initialConfig.maxCausalDepth
         )
         self.funnel = funnelInstance
         self.governance = RuntimeGovernance()
         self.callbacks = callbacks
-        self.actionDispatcher = ActionDispatcher(funnel: funnelInstance, notifyHandler: callbacks.onNotifyApproval)
-        self.runGate = ConcurrencyGate(limit: config.maxConcurrentRuns)
+        self.runGate = ConcurrencyGate(limit: initialConfig.maxConcurrentRuns)
+
+        final class WeakOrchestratorRef: @unchecked Sendable {
+            weak var value: Orchestrator?
+        }
+        let weakRef = WeakOrchestratorRef()
+        self.actionDispatcher = ActionDispatcher(
+            funnel: funnelInstance,
+            paths: paths,
+            configProvider: { weakRef.value?.currentConfig() ?? initialConfig },
+            notifyHandler: callbacks.onNotifyApproval
+        )
+        weakRef.value = self
     }
 
     public func start(
         enableBuiltInSensors: Bool = false,
+        enableWebhookServer: Bool = false,
         feishuDBURL: URL? = nil,
         skipExistingFeishuOnFirstRun: Bool = true
     ) throws {
@@ -133,6 +190,7 @@ public final class Orchestrator: @unchecked Sendable {
         stateLock.lock()
         self.bus = server
         self.builtInSensorsEnabled = enableBuiltInSensors
+        self.webhookServerSubsystemEnabled = enableWebhookServer
         if let feishuDBURL {
             self.customFeishuDBURL = feishuDBURL
         }
@@ -141,6 +199,9 @@ public final class Orchestrator: @unchecked Sendable {
 
         if enableBuiltInSensors {
             syncFeishuMonitor()
+        }
+        if enableWebhookServer {
+            syncWebhookServer()
         }
         startExpectWindowTimer()
 
@@ -159,13 +220,98 @@ public final class Orchestrator: @unchecked Sendable {
         expectTimer = nil
         let monitor = feishuMonitor
         feishuMonitor = nil
+        let whServer = webhookServer
+        webhookServer = nil
+        webhookServerSubsystemEnabled = false
         builtInSensorsEnabled = false
         stateLock.unlock()
         timer?.cancel()
         expTimer?.cancel()
         monitor?.stop()
+        whServer?.stop()
         bus?.stop()
         bus = nil
+    }
+
+    public func webhookStatus() -> WebhookStatusInfo {
+        stateLock.withLock {
+            WebhookStatusInfo(
+                enabled: config.webhookServerEnabled,
+                running: webhookServer?.isRunning ?? false,
+                host: config.webhookHost,
+                port: webhookServer?.boundPort ?? UInt16(clamping: config.webhookPort),
+                errorMessage: webhookServerError
+            )
+        }
+    }
+
+    private func syncWebhookServer() {
+        let (subsystemActive, enabled, host, port, existing): (Bool, Bool, String, UInt16, WebhookServer?) = stateLock.withLock {
+            (
+                webhookServerSubsystemEnabled,
+                config.webhookServerEnabled,
+                config.webhookHost,
+                UInt16(clamping: max(0, min(65535, config.webhookPort))),
+                webhookServer
+            )
+        }
+        guard subsystemActive else { return }
+
+        if !enabled {
+            if let existing {
+                stateLock.withLock {
+                    webhookServer = nil
+                    webhookServerError = nil
+                }
+                existing.stop()
+            }
+            return
+        }
+
+        if let existing, existing.isRunning, existing.host == host, existing.requestedPort == port {
+            return
+        }
+
+        existing?.stop()
+        let pathsCopy = self.paths
+        let server = WebhookServer(
+            host: host,
+            port: port,
+            tokenProvider: {
+                SecretStore.ensureWebhookToken(paths: pathsCopy)
+            },
+            onEmit: { [weak self] event in
+                guard let self else { return (false, "stopped") }
+                let resp = self.handleBusRequest(BusRequest(action: "emit", event: event))
+                return (resp.ok, resp.disposition ?? resp.message)
+            },
+            onInspectApproval: { [weak self] id in
+                guard let self, let rec = try? self.store.getApproval(id: id) else { return nil }
+                let isPending = (rec.status == "pending" || rec.status == "deferred")
+                return (pending: isPending, title: rec.title)
+            },
+            onResolveApproval: { [weak self] id, shouldApprove, comment in
+                guard let self else { return false }
+                if shouldApprove {
+                    return self.approve(id: id, comment: comment ?? "Approved via HTTP webhook")
+                } else {
+                    return self.reject(id: id, comment: comment ?? "Rejected via HTTP webhook")
+                }
+            }
+        )
+
+        do {
+            try server.start()
+            stateLock.withLock {
+                webhookServer = server
+                webhookServerError = nil
+            }
+        } catch {
+            stateLock.withLock {
+                webhookServer = nil
+                webhookServerError = error.localizedDescription
+            }
+        }
     }
 
     public func feishuSensorStatus() -> FeishuSensorStatus {
@@ -330,6 +476,217 @@ public final class Orchestrator: @unchecked Sendable {
         return (true, "已定向触发规则「\(rule.id)」")
     }
 
+    public func saveConfig(_ newConfig: AppConfig) throws {
+        try AppConfig.save(newConfig, to: paths.configFile)
+        reloadConfig()
+    }
+
+    public func setPreferredTerminal(_ terminal: String) {
+        try? AppConfig.setTerminal(terminal, in: paths.configFile)
+        reloadConfig()
+    }
+
+    @discardableResult
+    public func saveRule(_ rule: ChimeRule) throws -> ChimeRule {
+        let safeID = Self.sanitizeRuleID(rule.id)
+        guard !safeID.isEmpty else {
+            throw NSError(domain: "BianzhongOrchestrator", code: 400, userInfo: [NSLocalizedDescriptionKey: "规则 ID 不能为空"])
+        }
+        var updated = rule
+        updated.id = safeID
+        let canonicalURL = paths.chimesDir.appendingPathComponent("\(safeID).md")
+        let targetURL: URL
+        var oldURLToRemove: URL?
+
+        if let existingPath = rule.filePath, !existingPath.isEmpty {
+            let existingURL = URL(fileURLWithPath: existingPath)
+            let existingStem = existingURL.deletingPathExtension().lastPathComponent
+            if existingStem == safeID {
+                targetURL = existingURL
+            } else {
+                targetURL = canonicalURL
+                if Self.isSubpath(existingURL, of: paths.chimesDir),
+                   existingURL.standardizedFileURL.path != canonicalURL.standardizedFileURL.path {
+                    oldURLToRemove = existingURL
+                }
+            }
+        } else {
+            targetURL = canonicalURL
+        }
+
+        try updated.save(to: targetURL)
+        if let oldURLToRemove, FileManager.default.fileExists(atPath: oldURLToRemove.path) {
+            try? FileManager.default.removeItem(at: oldURLToRemove)
+        }
+        reloadConfig()
+        return funnel.currentRules().first(where: { $0.id == safeID }) ?? {
+            updated.filePath = targetURL.path
+            return updated
+        }()
+    }
+
+    @discardableResult
+    public func saveRawRuleMarkdown(id: String, filePath: String?, markdown: String) throws -> ChimeRule {
+        let parsed = ChimeRule.parse(markdown: markdown, defaultID: id.isEmpty ? "custom-rule" : id)
+        let safeID = Self.sanitizeRuleID(parsed.id)
+        guard !safeID.isEmpty else {
+            throw NSError(domain: "BianzhongOrchestrator", code: 400, userInfo: [NSLocalizedDescriptionKey: "Markdown 中缺少有效的规则 id"])
+        }
+        let canonicalURL = paths.chimesDir.appendingPathComponent("\(safeID).md")
+        let targetURL: URL
+        var oldURLToRemove: URL?
+
+        if let existingPath = filePath, !existingPath.isEmpty {
+            let existingURL = URL(fileURLWithPath: existingPath)
+            if existingURL.deletingPathExtension().lastPathComponent == safeID {
+                targetURL = existingURL
+            } else {
+                targetURL = canonicalURL
+                if Self.isSubpath(existingURL, of: paths.chimesDir),
+                   existingURL.standardizedFileURL.path != canonicalURL.standardizedFileURL.path {
+                    oldURLToRemove = existingURL
+                }
+            }
+        } else {
+            targetURL = canonicalURL
+        }
+
+        try FileManager.default.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try markdown.write(to: targetURL, atomically: true, encoding: .utf8)
+        if let oldURLToRemove, FileManager.default.fileExists(atPath: oldURLToRemove.path) {
+            try? FileManager.default.removeItem(at: oldURLToRemove)
+        }
+        reloadConfig()
+        return funnel.currentRules().first(where: { $0.id == safeID }) ?? parsed
+    }
+
+    private static func sanitizeRuleID(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: "\\", with: "-")
+            .replacingOccurrences(of: "..", with: "-")
+    }
+
+    private static func isSubpath(_ child: URL, of parentDir: URL) -> Bool {
+        let childPath = child.standardizedFileURL.resolvingSymlinksInPath().path
+        let parentPath = parentDir.standardizedFileURL.resolvingSymlinksInPath().path
+        let prefix = parentPath.hasSuffix("/") ? parentPath : parentPath + "/"
+        return childPath.hasPrefix(prefix)
+    }
+
+    public func deleteRule(id: String) throws {
+        guard let rule = funnel.currentRules().first(where: { $0.id == id }) else { return }
+        let path = rule.filePath ?? paths.chimesDir.appendingPathComponent("\(id).md").path
+        if FileManager.default.fileExists(atPath: path) {
+            try FileManager.default.removeItem(atPath: path)
+        }
+        reloadConfig()
+    }
+
+    /// Evaluates an incoming `bianzhong://` deep link with CSRF protection:
+    /// - Read-only navigation (`openConsole`) executes immediately.
+    /// - Mutating actions (`emit`, `approve`, `reject`) execute immediately ONLY when `token` matches `BIANZHONG_WEBHOOK_TOKEN`;
+    ///   missing `token` returns `.requiresConfirmation` so the GUI can prompt the user, and invalid `token` returns `.unauthorized`.
+    @discardableResult
+    public func handleIncomingURL(_ url: URL) -> IncomingURLOutcome {
+        guard let action = BianzhongURLRouter.parse(url) else { return .invalidURL }
+        if !action.isMutating {
+            callbacks.onApprovalUpdated()
+            return .handled(action)
+        }
+        let expectedToken = SecretStore.ensureWebhookToken(paths: paths)
+        if let provided = action.providedToken {
+            guard OutboundWebhookBuilder.constantTimeEquals(provided, expectedToken) else {
+                return .unauthorized
+            }
+            executeConfirmedURLAction(action)
+            return .handled(action)
+        }
+        return .requiresConfirmation(action)
+    }
+
+    public func executeConfirmedURLAction(_ action: BianzhongURLAction) {
+        switch action {
+        case .emit(let event, _):
+            _ = handleBusRequest(BusRequest(action: "emit", event: event))
+        case .approve(let id, let comment, _):
+            _ = approve(id: id, comment: comment ?? "Approved via bianzhong:// URL")
+        case .reject(let id, let comment, _):
+            _ = reject(id: id, comment: comment ?? "Rejected via bianzhong:// URL")
+        case .openConsole:
+            break
+        }
+        callbacks.onApprovalUpdated()
+    }
+
+    public func listManagedWorktrees() -> [ManagedWorktreeInfo] {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(
+            at: paths.worktreesDir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        return urls.compactMap { url -> ManagedWorktreeInfo? in
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { return nil }
+            let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+            let branch = runGitCapture(in: url.path, args: ["rev-parse", "--abbrev-ref", "HEAD"])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let porcelain = runGitCapture(in: url.path, args: ["status", "--porcelain"])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return ManagedWorktreeInfo(
+                name: url.lastPathComponent,
+                path: url.path,
+                branch: branch.isEmpty ? "HEAD" : branch,
+                isDirty: !porcelain.isEmpty,
+                modifiedAt: mtime
+            )
+        }
+        .sorted { $0.modifiedAt > $1.modifiedAt }
+    }
+
+    public func worktreeDiff(at path: String) -> String {
+        let status = runGitCapture(in: path, args: ["status", "-s"])
+        let diff = runGitCapture(in: path, args: ["diff", "HEAD"])
+        let combined = [
+            status.isEmpty ? "" : "# git status -s\n\(status)",
+            diff.isEmpty ? "" : diff
+        ].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        return combined.isEmpty ? "（当前 Worktree 无未提交的 Git 差异，可查看 git log -n 3）\n\n" + runGitCapture(in: path, args: ["log", "-n", "3", "--stat"]) : String(combined.prefix(16000))
+    }
+
+    public func removeWorktree(at path: String, force: Bool = false) throws {
+        let targetURL = URL(fileURLWithPath: path)
+        guard Self.isSubpath(targetURL, of: paths.worktreesDir) else {
+            throw NSError(domain: "BianzhongOrchestrator", code: 403, userInfo: [NSLocalizedDescriptionKey: "拒绝删除非受管 Worktree 路径：\(path)"])
+        }
+        if !force {
+            let porcelain = runGitCapture(in: targetURL.path, args: ["status", "--porcelain"])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !porcelain.isEmpty {
+                throw NSError(domain: "BianzhongOrchestrator", code: 409, userInfo: [NSLocalizedDescriptionKey: "Worktree 存在未提交改动，拒绝自动移除"])
+            }
+        }
+        guard RuntimeGovernance.detachAndRemoveWorktreeDir(at: targetURL.path) else {
+            throw NSError(domain: "BianzhongOrchestrator", code: 500, userInfo: [NSLocalizedDescriptionKey: "移除 Worktree 失败：\(path)"])
+        }
+        callbacks.onApprovalUpdated()
+    }
+
+    private func runGitCapture(in dir: String, args: [String]) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        proc.arguments = ["-C", dir] + args
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        guard (try? proc.run()) != nil else { return "" }
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return "" }
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    }
     public func retryFeishuSensor() {
         let monitor = stateLock.withLock { feishuMonitor }
         monitor?.retryNow()
@@ -493,6 +850,7 @@ public final class Orchestrator: @unchecked Sendable {
             await gate.updateLimit(newMaxRuns)
         }
         syncFeishuMonitor()
+        syncWebhookServer()
         callbacks.onApprovalUpdated()
     }
 
@@ -633,7 +991,7 @@ public final class Orchestrator: @unchecked Sendable {
             }
 
             if rule.triageEnabled && event.type != "dev.bianzhong.expect.missed" {
-                let provider = TriageProviderFactory.make(config: cfg, override: rule.triageProviderOverride)
+                let provider = TriageProviderFactory.make(config: cfg, override: rule.triageProviderOverride, paths: self.paths)
                 let req = TriageRequest(
                     event: event,
                     candidateRuleID: rule.id,
@@ -933,9 +1291,11 @@ public final class Orchestrator: @unchecked Sendable {
         return combined.isEmpty ? nil : String(combined.prefix(4096))
     }
 
-    public func approve(id: String, comment: String?) {
-        guard let approval = try? store.getApproval(id: id) else { return }
-        try? store.resolveApproval(id: id, status: "approved", comment: comment)
+    @discardableResult
+    public func approve(id: String, comment: String?) -> Bool {
+        guard let approval = (try? store.resolvePendingApprovalAtomically(id: id, status: "approved", comment: comment)) ?? nil else {
+            return false
+        }
         callbacks.onApprovalUpdated()
 
         guard approval.kind != "notify",
@@ -943,7 +1303,7 @@ public final class Orchestrator: @unchecked Sendable {
               let rule = funnel.currentRules().first(where: { $0.id == approval.chimeID }),
               !rule.phase2Prompt.isEmpty,
               let extSession = approval.externalSessionID else {
-            return
+            return true
         }
 
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -952,6 +1312,7 @@ public final class Orchestrator: @unchecked Sendable {
                 await self.performPhase2(approval: approval, rule: rule, extSession: extSession, comment: comment)
             }
         }
+        return true
     }
 
     private func performPhase2(approval: ApprovalRecord, rule: ChimeRule, extSession: String, comment: String?) async {
@@ -1180,17 +1541,22 @@ public final class Orchestrator: @unchecked Sendable {
         return digestRecord
     }
 
-    public func reject(id: String, comment: String?) {
-        try? store.resolveApproval(id: id, status: "rejected", comment: comment)
+    @discardableResult
+    public func reject(id: String, comment: String?) -> Bool {
+        guard ((try? store.resolvePendingApprovalAtomically(id: id, status: "rejected", comment: comment)) ?? nil) != nil else {
+            return false
+        }
         callbacks.onApprovalUpdated()
+        return true
     }
 
     public func copyAndOpenFeishu(id: String) {
-        guard let approval = try? store.getApproval(id: id) else { return }
+        guard let approval = (try? store.resolvePendingApprovalAtomically(id: id, status: "approved", comment: "Copied to Feishu")) ?? nil else {
+            return
+        }
         TerminalLauncher.copyAndOpenFeishu(text: approval.proposedAction) { [weak self] hash in
             self?.funnel.registerEchoHash(hash, ttlSeconds: 30)
         }
-        try? store.resolveApproval(id: id, status: "approved", comment: "Copied to Feishu")
         callbacks.onApprovalUpdated()
     }
 

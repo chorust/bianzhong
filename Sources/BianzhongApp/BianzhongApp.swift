@@ -17,12 +17,55 @@ struct RuleTestFeedback: Equatable {
     let message: String
 }
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+    }
+
+    @objc private func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let urlString = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: urlString) else {
+            return
+        }
+        Task { @MainActor in
+            AppModel.shared?.handleURL(url)
+        }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        Task { @MainActor in
+            for url in urls {
+                AppModel.shared?.handleURL(url)
+            }
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
+    static weak var shared: AppModel?
+
     @Published var selectedTab: MenuBarTab = .inbox
+    @Published var consoleSection: ConsoleSection = .general
+    @Published var consoleSelectedRuleID: String?
+    @Published var auditStageFilter: String = "all"
+    @Published var auditSearchQuery: String = ""
     @Published var pendingApprovals: [ApprovalRecord] = []
     @Published var recentRuns: [RunRecord] = []
     @Published var rules: [ChimeRule] = []
+    @Published var auditEvents: [EventAuditRecord] = []
+    @Published var worktrees: [ManagedWorktreeInfo] = []
+    @Published var storedSecrets: [String: String] = [:]
+    @Published var webhookToken: String = ""
+    @Published var webhookStatus: WebhookStatusInfo = WebhookStatusInfo(enabled: true, running: false, host: "127.0.0.1", port: 17380, errorMessage: nil)
+    @Published var preferredTerminal: String = "auto"
+    @Published var todayRunsCount: Int = 0
+    @Published var todayCostUSD: Double = 0.0
     @Published var paused = false
     @Published var deferredCount = 0
     @Published var feishuEnabled = true
@@ -33,6 +76,7 @@ final class AppModel: ObservableObject {
 
     let orchestrator: Orchestrator
     let notificationManager: NotificationManager
+    private var consoleWindow: NSWindow?
     private var wakeObservers: [Any] = []
     private var promptedFDACurrentSession = false
     private var isPresentingFDAAlert = false
@@ -68,11 +112,82 @@ final class AppModel: ObservableObject {
         }
         self.notificationManager = NotificationManager(orchestrator: self.orchestrator)
         capturedSelf = self
+        Self.shared = self
 
-        try? orchestrator.start(enableBuiltInSensors: true)
+        try? orchestrator.start(enableBuiltInSensors: true, enableWebhookServer: true)
         notificationManager.setupIfSupported()
         registerWakeObservers()
         refresh()
+    }
+
+    func openConsoleWindow(section: ConsoleSection? = nil, ruleID: String? = nil) {
+        if let section {
+            consoleSection = section
+        }
+        if let ruleID {
+            consoleSelectedRuleID = ruleID
+        }
+        refreshConsoleData()
+
+        if let existing = consoleWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let contentView = ConsoleWindowView(model: self)
+        let hosting = NSHostingController(rootView: contentView)
+        let window = NSWindow(contentViewController: hosting)
+        window.title = "编钟 Bianzhong · 控制台与设置"
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.setContentSize(NSSize(width: 920, height: 620))
+        window.center()
+        window.isReleasedWhenClosed = false
+        self.consoleWindow = window
+
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func handleURL(_ url: URL) {
+        switch orchestrator.handleIncomingURL(url) {
+        case .invalidURL:
+            return
+        case .unauthorized:
+            statusBannerMessage = "已拦截令牌无效的 bianzhong:// 外部请求"
+        case .handled(let action):
+            refresh()
+            if case .openConsole(let tabRaw, let ruleID) = action {
+                let sec = tabRaw.flatMap { ConsoleSection(rawValue: $0.lowercased()) } ?? .general
+                openConsoleWindow(section: sec, ruleID: ruleID)
+            }
+        case .requiresConfirmation(let action):
+            confirmExternalURLAction(action)
+        }
+    }
+
+    private func confirmExternalURLAction(_ action: BianzhongURLAction) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "确认执行外部链接请求？"
+        switch action {
+        case .emit(let ev, _):
+            let title = ev.payload["title"] ?? ev.type
+            alert.informativeText = "外部应用请求向 Bianzhong 注入信号：\n类型：\(ev.type)\n标题：\(title)\n\n（提示：在受信任脚本中附带 ?token=<WebhookToken> 可免弹窗静默执行）"
+        case .approve(let id, _, _):
+            alert.informativeText = "外部链接请求【批准执行】审批单：\(id)\n批准后可能触发 Phase 2 代码修改或本地动作。"
+        case .reject(let id, _, _):
+            alert.informativeText = "外部链接请求【忽略/驳回】审批单：\(id)"
+        case .openConsole:
+            return
+        }
+        alert.addButton(withTitle: "确认执行")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn {
+            orchestrator.executeConfirmedURLAction(action)
+            refresh()
+        }
     }
 
     private func registerWakeObservers() {
@@ -104,15 +219,22 @@ final class AppModel: ObservableObject {
 
     func refresh() {
         let previousFeishuStatus = feishuStatus
+        let cfg = orchestrator.currentConfig()
         pendingApprovals = orchestrator.pendingApprovals()
         recentRuns = orchestrator.recentRuns()
         rules = orchestrator.allRules()
         paused = orchestrator.isPaused()
         deferredCount = orchestrator.deferredDigestCount()
-        feishuEnabled = orchestrator.currentConfig().feishuSensorEnabled
+        feishuEnabled = cfg.feishuSensorEnabled
+        preferredTerminal = cfg.terminal
         feishuStatus = orchestrator.feishuSensorStatus()
         feishuErrorMessage = orchestrator.feishuSensorErrorMessage()
+        webhookStatus = orchestrator.webhookStatus()
         cliStatus = CLIIntegration.currentStatus()
+
+        if consoleWindow?.isVisible == true {
+            refreshConsoleData()
+        }
 
         if feishuEnabled,
            feishuStatus == .needsFullDiskAccess,
@@ -124,6 +246,40 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 self?.presentFDAGuideAlert(allowSuppression: true)
             }
+        }
+    }
+
+    func refreshConsoleData() {
+        webhookStatus = orchestrator.webhookStatus()
+        webhookToken = SecretStore.ensureWebhookToken(paths: orchestrator.paths)
+        storedSecrets = SecretStore.loadAll(paths: orchestrator.paths)
+        worktrees = orchestrator.listManagedWorktrees()
+        recentRuns = orchestrator.recentRuns()
+        if let usage = try? orchestrator.store.todayUsageSummary() {
+            todayRunsCount = usage.runsCount
+            todayCostUSD = usage.totalCostUSD
+        }
+        loadAuditEvents(stageFilter: auditStageFilter, query: auditSearchQuery)
+    }
+
+    func loadAuditEvents(stageFilter: String?, query: String?) {
+        auditEvents = (try? orchestrator.store.listEventAuditRecords(limit: 120, stageFilter: stageFilter, searchQuery: query)) ?? []
+    }
+
+    func saveSecret(key: String, value: String) {
+        try? SecretStore.set(key: key, value: value, paths: orchestrator.paths)
+        storedSecrets = SecretStore.loadAll(paths: orchestrator.paths)
+    }
+
+    func deleteSecret(key: String) {
+        try? SecretStore.remove(key: key, paths: orchestrator.paths)
+        storedSecrets = SecretStore.loadAll(paths: orchestrator.paths)
+    }
+
+    func rotateWebhookToken() {
+        if let rotated = try? SecretStore.rotateWebhookToken(paths: orchestrator.paths) {
+            webhookToken = rotated
+            storedSecrets = SecretStore.loadAll(paths: orchestrator.paths)
         }
     }
 
@@ -383,6 +539,15 @@ struct MenuBarRootView: View {
 
             Spacer()
 
+            Button {
+                model.openConsoleWindow()
+            } label: {
+                Label("控制台", systemImage: "macwindow")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .keyboardShortcut(",", modifiers: .command)
+
             Button(model.paused ? "恢复" : "暂停 1h") {
                 if model.paused {
                     model.orchestrator.resume()
@@ -394,17 +559,24 @@ struct MenuBarRootView: View {
             .controlSize(.small)
 
             Menu {
+                Button("打开统一控制台与设置...") {
+                    model.openConsoleWindow(section: .general)
+                }
+                Button("查看信号漏斗透视...") {
+                    model.openConsoleWindow(section: .events)
+                }
+                Button("管理双向 Webhook 与密钥...") {
+                    model.openConsoleWindow(section: .webhooks)
+                }
+                Divider()
                 Button("重载配置与规则") {
                     model.orchestrator.reloadConfig()
                 }
-                Button("打开规则配置助手") {
+                Button("打开终端 AI 配置助手") {
                     model.openConfigChat()
                 }
                 Button("误报调优") {
                     model.openTuneChat()
-                }
-                Button("打开配置目录") {
-                    model.openConfigDirectory()
                 }
                 Divider()
                 Button("退出 Bianzhong") {
@@ -434,9 +606,9 @@ struct MenuBarRootView: View {
         } else if model.feishuEnabled && model.feishuStatus == .unavailable {
             pill(color: .orange, text: "飞书不可用")
         } else if model.feishuEnabled && model.feishuStatus == .watching {
-            pill(color: .green, text: "飞书已连")
+            pill(color: .green, text: model.webhookStatus.running ? "飞书 · Webhook" : "飞书已连")
         } else {
-            pill(color: .secondary, text: "仅本地信号")
+            pill(color: model.webhookStatus.running ? .green : .secondary, text: model.webhookStatus.running ? "Webhook 就绪" : "仅本地信号")
         }
     }
 
@@ -574,8 +746,8 @@ struct RulesTabView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("+ 新建规则") {
-                    model.openConfigChat()
+                Button("规则工作台 ↗") {
+                    model.openConsoleWindow(section: .rules)
                 }
                 .controlSize(.small)
                 Button {
@@ -592,8 +764,8 @@ struct RulesTabView: View {
                     Text("尚未加载任何规则")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    Button("创建第一条规则") {
-                        model.openConfigChat()
+                    Button("打开规则工作台创建") {
+                        model.openConsoleWindow(section: .rules)
                     }
                     .controlSize(.small)
                 }
@@ -689,7 +861,7 @@ struct RuleRowCard: View {
                 .controlSize(.mini)
 
                 Button("编辑") {
-                    model.openRuleFile(rule)
+                    model.openConsoleWindow(section: .rules, ruleID: rule.id)
                 }
                 .controlSize(.mini)
             }
@@ -759,6 +931,36 @@ struct SettingsTabView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
+                        Text("默认终端")
+                            .font(.subheadline.bold())
+                        Text("接管会话与打开规则目录时使用")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { model.preferredTerminal },
+                        set: { newVal in
+                            model.orchestrator.setPreferredTerminal(newVal)
+                            model.refresh()
+                        }
+                    )) {
+                        let autoName = TerminalLauncher.detectTerminal(preference: "auto").displayName
+                        Text("自动 (\(autoName))").tag("auto")
+                        Divider()
+                        ForEach(TerminalLauncher.TerminalApp.allCases) { app in
+                            if app.isInstalled || app == .terminal || app.rawValue == model.preferredTerminal {
+                                Text(app.isInstalled ? app.displayName : "\(app.displayName)（未安装）").tag(app.rawValue)
+                            }
+                        }
+                    }
+                    .frame(width: 165)
+                }
+
+                Divider()
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
                         Text("飞书通知监听")
                             .font(.subheadline.bold())
                         Text(feishuSubtitle)
@@ -785,6 +987,23 @@ struct SettingsTabView: View {
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
+                        Text("入站 HTTP Webhook")
+                            .font(.subheadline.bold())
+                        Text(model.webhookStatus.running ? "运行中 127.0.0.1:\(model.webhookStatus.port)" : "未启用")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("配置与密钥 ↗") {
+                        model.openConsoleWindow(section: .webhooks)
+                    }
+                    .controlSize(.small)
+                }
+
+                Divider()
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
                         Text("Zsh 慢命令钩子")
                             .font(.subheadline.bold())
                         Text("自动在 ~/.zshrc 监听耗时 ≥15s 的失败命令")
@@ -800,45 +1019,29 @@ struct SettingsTabView: View {
                     .controlSize(.small)
                     .labelsHidden()
                 }
-
-                Divider()
-
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("bz 命令行工具")
-                            .font(.subheadline.bold())
-                        Text(model.cliStatus.isCLIInstalled ? "已安装，可在终端直接使用 bz" : "未安装到 PATH")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button(model.cliStatus.isCLIInstalled ? "修复链接" : "安装") {
-                        model.reinstallCLISymlink()
-                    }
-                    .controlSize(.small)
-                }
             }
             .padding(10)
             .background(Color(nsColor: .controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
             HStack(spacing: 6) {
-                Button("规则调优") {
-                    model.openTuneChat()
+                Button("打开统一控制台与设置 ↗") {
+                    model.openConsoleWindow(section: .general)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                Button("信号透视") {
+                    model.openConsoleWindow(section: .events)
                 }
                 .controlSize(.small)
 
-                Button("配置目录") {
-                    model.openConfigDirectory()
-                }
-                .controlSize(.small)
+                Spacer()
 
                 Button("清理过期数据") {
                     model.runGC()
                 }
                 .controlSize(.small)
-
-                Spacer()
             }
         }
     }
@@ -925,6 +1128,7 @@ struct ApprovalCard: View {
 }
 
 struct BianzhongMenuBarApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
 
     var body: some Scene {

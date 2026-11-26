@@ -4,10 +4,17 @@ import Foundation
 public enum DefaultTemplates {
     public static let configYAML = """
     # Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)
-    terminal: auto                # auto | ghostty | iterm | warp | terminal
+    terminal: auto                # auto | ghostty | iterm | warp | kitty | wezterm | alacritty | cmux | terminal
     feishu_sensor_enabled: true   # 需在 系统设置 -> 完全磁盘访问权限 中授予 Bianzhong.app
     max_concurrent_runs: 2
     max_causal_depth: 1
+
+    # 入站/出站双向 Webhook 网关（Token 自动保存在本地 0600 secrets.json，不入库 Git）
+    webhook_server:
+      enabled: true
+      host: 127.0.0.1             # 如需内网/Tailscale 回调可改为 0.0.0.0
+      port: 17380
+      callback_base_url: null     # 例如 https://macbook.tailnet.ts.net:17380
 
     # 全局预算、熔断与自动清理治理
     governance:
@@ -38,8 +45,9 @@ public enum DefaultTemplates {
     你正在帮助用户在 `~/.config/bianzhong/` 中创建、修改或调试 **Bianzhong（编钟）** 的事件驱动规则（`chimes/*.md`）与全局配置（`config.yml`）。
 
     ## 目录结构
-    - `config.yml`: 全局分诊器（`triage.provider`: `apple_fm` | `agent_cli` | `decision_api` | `none`）、治理上限（`governance.*`）、默认终端与候选工作区。
+    - `config.yml`: 全局分诊器（`triage.provider`: `apple_fm` | `agent_cli` | `decision_api` | `none`）、治理上限（`governance.*`）、默认终端（`terminal`: `auto` | `ghostty` | `iterm` | `warp` | `kitty` | `wezterm` | `alacritty` | `cmux` | `terminal`）、双向 Webhook 网关（`webhook_server.*`）与候选工作区。
     - `chimes/*.md`: 每条触发规则是一个独立的 Markdown 文件（YAML Frontmatter + `## Phase 1` / `## Phase 2` 行动剧本）。
+    - 注意：API Key 与 Webhook 密钥推荐通过统一控制台（MenuBar「控制台」或 `⌘,`）保存在应用数据目录 `secrets.json`（`0600` 权限，不写入 `~/.config/bianzhong` 以免泄露到 Git）。
 
     ## Chime 规则格式规范
     ```markdown
@@ -102,7 +110,9 @@ public enum DefaultTemplates {
     on_complete:
       - type: notify
       - type: webhook
-        url_env: BIANZHONG_WEBHOOK_URL
+        preset: feishu_bot                         # raw | feishu_bot | slack | bark | discord | telegram
+        url_env: BIANZHONG_WEBHOOK_URL             # 从本地 secrets.json 或环境变量读取
+        secret_env: FEISHU_BOT_SECRET              # 可选：飞书机器人签名校验密钥或出站 HMAC 密钥
         when: "screen_locked == true || idle_seconds > 600"
       - type: append_markdown
         path: "~/Notes/Bianzhong/{{date}}.md"
@@ -120,12 +130,16 @@ public enum DefaultTemplates {
 
     ## 支持的后置动作 (`on_complete`)
     - `notify`: 弹出系统交互通知并写入 MenuBar 听音台
-    - `webhook`: 向 `url` 或环境变量 `url_env` 发送 JSON POST
+    - `webhook`: 支持多平台预设（`preset`: `raw` | `feishu_bot` | `slack` | `bark` | `discord` | `telegram`）、飞书加签（`secret_env`）以及带 HMAC 过期签名的远程批准/驳回回调按钮
     - `shortcut`: 执行 `shortcuts run <name>`（stdin 传入摘要）
     - `append_markdown`: 向本地日记追加记录（支持 `{{date}}` 与防自激写租约）
     - `shell`: 运行轻量本地 `/bin/zsh -lc <cmd>`
     - `clipboard`: 写入带 `TransientType` 标记的剪贴板
     - `chime_sound`: 播放 `/System/Library/Sounds/<name>.aiff`，设 `tts: true` 可轻语音播报
+
+    ## 入站网关与 URL Scheme
+    - 本地 HTTP Webhook 网关（默认 `http://127.0.0.1:17380`）：支持 `POST /v1/emit` 与 `POST /v1/hooks/{github|feishu|sentry|grafana|alertmanager|generic}`（需携带 `Authorization: Bearer <BIANZHONG_WEBHOOK_TOKEN>` 或 `X-Hub-Signature-256`）。
+    - 系统级 URL Scheme：`bianzhong://emit?type=dev.bianzhong.url.emit&title=...&body=...`、`bianzhong://console?tab=rules`、`bianzhong://approve?id=...`。
 
     ## 常见事件类型 (type)
     - `dev.bianzhong.feishu.notification`: 飞书通知中心传感器捕获的消息（`payload.title` 为群名/联系人，`payload.subtitle` 为发送者，`payload.body` 为正文）。
