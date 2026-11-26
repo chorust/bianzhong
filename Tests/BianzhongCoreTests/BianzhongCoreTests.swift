@@ -1401,7 +1401,7 @@ struct BianzhongCoreTests {
         """
         let expectFile = paths.chimesDir.appendingPathComponent("daily-report-watchdog.md")
         try expectMD.write(to: expectFile, atomically: true, encoding: .utf8)
-        let earlyMod = cal.date(from: DateComponents(year: 2026, month: 11, day: 24, hour: 12, minute: 0))!
+        let earlyMod = cal.date(from: DateComponents(year: 2025, month: 11, day: 24, hour: 12, minute: 0))!
         try FileManager.default.setAttributes([.modificationDate: earlyMod], ofItemAtPath: expectFile.path)
 
         let orch = try Orchestrator(paths: paths)
@@ -1410,9 +1410,9 @@ struct BianzhongCoreTests {
         #expect(loadedExpect?.expectWindow?.windowEnd == "09:30")
         #expect(loadedExpect?.expectWindow?.weekdays == [1, 2, 3, 4, 5])
 
-        // Wednesday 2026-11-25 09:15: signal arrives on time -> satisfied, no alert after 09:35
-        let wed0915 = cal.date(from: DateComponents(year: 2026, month: 11, day: 25, hour: 9, minute: 15))!
-        let wed0935 = cal.date(from: DateComponents(year: 2026, month: 11, day: 25, hour: 9, minute: 35))!
+        // Tuesday 2025-11-25 09:15: signal arrives on time -> satisfied, no alert after 09:35
+        let wed0915 = cal.date(from: DateComponents(year: 2025, month: 11, day: 25, hour: 9, minute: 15))!
+        let wed0935 = cal.date(from: DateComponents(year: 2025, month: 11, day: 25, hour: 9, minute: 35))!
         let reportMsg = EventEnvelope(source: "bz://sensor/feishu", type: "dev.bianzhong.feishu.notification", correlationKey: "r1", payload: ["title": "数据日报群", "body": "今日日报已产出"])
         let disp = orch.funnel.ingest(reportMsg, now: wed0915, onReady: { _, _ in })
         if case .dropped(let stage, _) = disp {
@@ -1423,17 +1423,17 @@ struct BianzhongCoreTests {
         let missedOnWed = orch.checkExpectWindows(now: wed0935, calendar: cal)
         #expect(missedOnWed.isEmpty)
 
-        // Thursday 2026-11-26 09:35: no signal arrived -> fires once!
-        let thu0935 = cal.date(from: DateComponents(year: 2026, month: 11, day: 26, hour: 9, minute: 35))!
+        // Wednesday 2025-11-26 09:35: no signal arrived -> fires once!
+        let thu0935 = cal.date(from: DateComponents(year: 2025, month: 11, day: 26, hour: 9, minute: 35))!
         let missedOnThu1 = orch.checkExpectWindows(now: thu0935, calendar: cal)
         #expect(missedOnThu1.count == 1)
         #expect(missedOnThu1.first?.type == "dev.bianzhong.expect.missed")
-        // Second check on same Thursday must not double-fire
+        // Second check on same day must not double-fire
         let missedOnThu2 = orch.checkExpectWindows(now: thu0935, calendar: cal)
         #expect(missedOnThu2.isEmpty)
 
-        // Saturday 2026-11-28 09:35: not in weekdays [1..5] -> does not fire
-        let sat0935 = cal.date(from: DateComponents(year: 2026, month: 11, day: 28, hour: 9, minute: 35))!
+        // Saturday 2025-11-29 09:35: not in weekdays [1..5] -> does not fire
+        let sat0935 = cal.date(from: DateComponents(year: 2025, month: 11, day: 29, hour: 9, minute: 35))!
         #expect(orch.checkExpectWindows(now: sat0935, calendar: cal).isEmpty)
 
         // (d) Rule toggle on disk via Orchestrator.setRuleEnabled preserves file & updates state
