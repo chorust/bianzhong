@@ -342,7 +342,7 @@ public enum AcpSessionRunner {
             }
         }
         let stderrBox = StderrBox()
-        DispatchQueue.global(qos: .utility).async {
+        Thread.detachNewThread {
             var buf = [UInt8](repeating: 0, count: 4096)
             while true {
                 let n = Darwin.read(errFD, &buf, buf.count)
@@ -829,7 +829,7 @@ private final class AcpLineTransport: @unchecked Sendable {
 
         let rfd = readFD
         let streamCont = cont!
-        DispatchQueue.global(qos: .userInitiated).async {
+        Thread.detachNewThread {
             var buffer = Data()
             var chunk = [UInt8](repeating: 0, count: 8192)
             while true {

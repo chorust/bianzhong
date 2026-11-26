@@ -711,7 +711,7 @@ public enum AgentProcessRunner {
         onStdoutLine: (@Sendable (String) -> Void)? = nil
     ) async -> ProcessRunResult {
         await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
+            Thread.detachNewThread {
                 let result = runSync(spec: spec, timeoutSeconds: timeoutSeconds, handle: handle, onStdoutLine: onStdoutLine)
                 continuation.resume(returning: result)
             }
@@ -839,7 +839,10 @@ public enum AgentProcessRunner {
         handle?.bind(pid: pid)
 
         final class DataBox: @unchecked Sendable {
-            var value = Data()
+            private let lock = NSLock()
+            private var storage = Data()
+            func set(_ data: Data) { lock.withLock { storage = data } }
+            func get() -> Data { lock.withLock { storage } }
         }
 
         let stdoutBox = DataBox()
@@ -848,16 +851,18 @@ public enum AgentProcessRunner {
 
         let stdoutReadFD = stdoutPipe[0]
         group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            stdoutBox.value = readStreamingFD(stdoutReadFD, onLine: onStdoutLine)
+        Thread.detachNewThread {
+            let out = readStreamingFD(stdoutReadFD, onLine: onStdoutLine)
+            stdoutBox.set(out)
             close(stdoutReadFD)
             group.leave()
         }
 
         let stderrReadFD = stderrPipe[0]
         group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            stderrBox.value = readAllFD(stderrReadFD)
+        Thread.detachNewThread {
+            let err = readAllFD(stderrReadFD)
+            stderrBox.set(err)
             close(stderrReadFD)
             group.leave()
         }
@@ -865,7 +870,7 @@ public enum AgentProcessRunner {
         if let stdinData = spec.stdinData, !stdinData.isEmpty {
             let stdinWriteFD = stdinPipe[1]
             group.enter()
-            DispatchQueue.global(qos: .utility).async {
+            Thread.detachNewThread {
                 _ = stdinData.withUnsafeBytes { raw in
                     guard let base = raw.baseAddress, raw.count > 0 else { return true }
                     return writeAllIgnoringPipe(fd: stdinWriteFD, buffer: base, length: raw.count)
@@ -900,7 +905,7 @@ public enum AgentProcessRunner {
         }
         handle?.markReaped()
 
-        _ = group.wait(timeout: .now() + 2.0)
+        _ = group.wait(timeout: .now() + 5.0)
 
         let exitCode: Int32
         if timedOut {
@@ -916,8 +921,8 @@ public enum AgentProcessRunner {
             pgid: pid,
             exitCode: exitCode,
             timedOut: timedOut,
-            stdout: String(data: stdoutBox.value, encoding: .utf8) ?? "",
-            stderr: String(data: stderrBox.value, encoding: .utf8) ?? ""
+            stdout: String(data: stdoutBox.get(), encoding: .utf8) ?? "",
+            stderr: String(data: stderrBox.get(), encoding: .utf8) ?? ""
         )
     }
 
