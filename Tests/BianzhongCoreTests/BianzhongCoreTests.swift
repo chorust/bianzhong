@@ -2650,6 +2650,23 @@ struct BianzhongCoreTests {
         #expect(orch.isPaused() == true)
         try await Task.sleep(for: .milliseconds(400))
         #expect(orch.isPaused() == false)
+
+        // (f) Customizable Notch Hotkey parsing, keycode/modifier mapping, and config persistence
+        let defaultSpec = try #require(NotchHotkeySpec.parse("option+space"))
+        #expect(defaultSpec.keyCode == 49)
+        #expect(defaultSpec.carbonModifiers == NotchHotkeySpec.carbonOptionKey)
+        #expect(defaultSpec.displayString == "⌥Space")
+
+        let customRecorded = try #require(NotchHotkeySpec.fromKeyEvent(keyCode: 11, command: true, option: false, control: false, shift: true))
+        #expect(customRecorded.canonicalString == "shift+cmd+b")
+        #expect(customRecorded.displayString == "⇧⌘B")
+        #expect(NotchHotkeySpec.fromKeyEvent(keyCode: 0, command: false, option: false, control: false, shift: false) == nil) // bare 'a' rejected
+        #expect(NotchHotkeySpec.parse("none") == nil)
+        #expect(NotchHotkeySpec.displayLabel(for: "none") == "无")
+
+        orch.setNotchHotkey("ctrl+space")
+        #expect(orch.currentConfig().notchHotkey == "ctrl+space")
+        #expect(AppConfig.load(from: paths.configFile).notchHotkey == "ctrl+space")
     }
 }
 

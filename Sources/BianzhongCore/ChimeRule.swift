@@ -164,6 +164,7 @@ public struct AppConfig: Sendable, Equatable {
     public var agentCLIModel: String?
     public var terminal: String
     public var notchHUDEnabled: Bool
+    public var notchHotkey: String
     public var feishuSensorEnabled: Bool
     public var webhookServerEnabled: Bool
     public var webhookHost: String
@@ -186,6 +187,7 @@ public struct AppConfig: Sendable, Equatable {
         agentCLIModel: String? = "smol",
         terminal: String = "auto",
         notchHUDEnabled: Bool = true,
+        notchHotkey: String = "option+space",
         feishuSensorEnabled: Bool = true,
         webhookServerEnabled: Bool = true,
         webhookHost: String = "127.0.0.1",
@@ -207,6 +209,7 @@ public struct AppConfig: Sendable, Equatable {
         self.agentCLIModel = agentCLIModel
         self.terminal = terminal
         self.notchHUDEnabled = notchHUDEnabled
+        self.notchHotkey = notchHotkey
         self.feishuSensorEnabled = feishuSensorEnabled
         self.webhookServerEnabled = webhookServerEnabled
         self.webhookHost = webhookHost
@@ -297,6 +300,7 @@ public struct AppConfig: Sendable, Equatable {
         switch key {
         case "terminal": config.terminal = val
         case "notch_hud_enabled": config.notchHUDEnabled = parseBool(val, default: config.notchHUDEnabled)
+        case "notch_hotkey": config.notchHotkey = val.isEmpty ? "none" : val
         case "feishu_sensor_enabled": config.feishuSensorEnabled = parseBool(val, default: config.feishuSensorEnabled)
         case "webhook_server_enabled": config.webhookServerEnabled = parseBool(val, default: config.webhookServerEnabled)
         case "webhook_host": config.webhookHost = val.isEmpty ? config.webhookHost : val
@@ -329,6 +333,7 @@ public struct AppConfig: Sendable, Equatable {
             "# Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)",
             "terminal: \(yamlScalar(config.terminal))",
             "notch_hud_enabled: \(config.notchHUDEnabled)",
+            "notch_hotkey: \(yamlScalar(config.notchHotkey))",
             "feishu_sensor_enabled: \(config.feishuSensorEnabled)",
             "max_concurrent_runs: \(config.maxConcurrentRuns)",
             "max_causal_depth: \(config.maxCausalDepth)",
@@ -388,6 +393,12 @@ public struct AppConfig: Sendable, Equatable {
     /// Updates or inserts `notch_hud_enabled` at top level inside `config.yml` without disturbing nested keys or comments.
     public static func setNotchHUDEnabled(_ enabled: Bool, in configFile: URL) throws {
         try setTopLevelScalar(key: "notch_hud_enabled", renderedValue: "\(enabled)", in: configFile)
+    }
+
+    /// Updates or inserts `notch_hotkey` at top level inside `config.yml` without disturbing nested keys or comments.
+    public static func setNotchHotkey(_ hotkey: String, in configFile: URL) throws {
+        let normalized = hotkey.trimmingCharacters(in: .whitespacesAndNewlines)
+        try setTopLevelScalar(key: "notch_hotkey", renderedValue: yamlScalar(normalized.isEmpty ? "none" : normalized), in: configFile)
     }
 
     private static func setTopLevelScalar(key: String, renderedValue: String, in configFile: URL) throws {
@@ -1346,6 +1357,217 @@ private func parseWeekdays(_ raw: String) -> [Int] {
         }
     }
     return Array(Set(result)).sorted()
+}
+
+/// Parses, formats, and maps zero-TCC Carbon global hotkeys (e.g. `option+space`, `ctrl+space`, `cmd+shift+b`, `f12`, `none`).
+public struct NotchHotkeySpec: Sendable, Equatable {
+    public let keyCode: UInt32
+    public let carbonModifiers: UInt32
+    public let canonicalString: String
+    public let displayString: String
+
+    // Standard Carbon modifier masks (<HIToolbox/Events.h>)
+    public static let carbonCmdKey: UInt32 = 256       // 1 << 8
+    public static let carbonShiftKey: UInt32 = 512     // 1 << 9
+    public static let carbonOptionKey: UInt32 = 2048   // 1 << 11
+    public static let carbonControlKey: UInt32 = 4096  // 1 << 12
+
+    public static func displayLabel(for raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed.isEmpty || trimmed == "none" || trimmed == "off" || trimmed == "disabled" {
+            return "无"
+        }
+        return parse(raw)?.displayString ?? raw
+    }
+
+    public static func parse(_ raw: String) -> NotchHotkeySpec? {
+        let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if cleaned.isEmpty || cleaned == "none" || cleaned == "off" || cleaned == "disabled" {
+            return nil
+        }
+
+        let parts = cleaned.split(separator: "+").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !parts.isEmpty else { return nil }
+
+        var cmd = false
+        var opt = false
+        var ctrl = false
+        var shift = false
+        var keyToken: String?
+
+        for tok in parts {
+            switch tok {
+            case "cmd", "command", "meta", "⌘": cmd = true
+            case "opt", "option", "alt", "⌥": opt = true
+            case "ctrl", "control", "⌃": ctrl = true
+            case "shift", "⇧": shift = true
+            default: keyToken = tok
+            }
+        }
+
+        guard let keyName = keyToken, let entry = keyTableByName[keyName] else {
+            return nil
+        }
+        if !cmd && !opt && !ctrl && !shift && !entry.isFunctionKey {
+            return nil
+        }
+        return buildSpec(entry: entry, command: cmd, option: opt, control: ctrl, shift: shift)
+    }
+
+    public static func fromKeyEvent(
+        keyCode: UInt16,
+        command: Bool,
+        option: Bool,
+        control: Bool,
+        shift: Bool
+    ) -> NotchHotkeySpec? {
+        guard let entry = keyTableByCode[UInt32(keyCode)] else { return nil }
+        if !command && !option && !control && !shift && !entry.isFunctionKey {
+            return nil
+        }
+        return buildSpec(entry: entry, command: command, option: option, control: control, shift: shift)
+    }
+
+    private static func buildSpec(
+        entry: KeyEntry,
+        command: Bool,
+        option: Bool,
+        control: Bool,
+        shift: Bool
+    ) -> NotchHotkeySpec {
+        var mask: UInt32 = 0
+        var canonParts: [String] = []
+        var disp = ""
+
+        if control {
+            mask |= carbonControlKey
+            canonParts.append("ctrl")
+            disp += "⌃"
+        }
+        if option {
+            mask |= carbonOptionKey
+            canonParts.append("option")
+            disp += "⌥"
+        }
+        if shift {
+            mask |= carbonShiftKey
+            canonParts.append("shift")
+            disp += "⇧"
+        }
+        if command {
+            mask |= carbonCmdKey
+            canonParts.append("cmd")
+            disp += "⌘"
+        }
+
+        canonParts.append(entry.canonical)
+        disp += entry.display
+        return NotchHotkeySpec(
+            keyCode: entry.code,
+            carbonModifiers: mask,
+            canonicalString: canonParts.joined(separator: "+"),
+            displayString: disp
+        )
+    }
+
+    private struct KeyEntry: Sendable {
+        let code: UInt32
+        let canonical: String
+        let display: String
+        let aliases: [String]
+        let isFunctionKey: Bool
+    }
+
+    private static let allKeys: [KeyEntry] = [
+        KeyEntry(code: 49, canonical: "space", display: "Space", aliases: ["space", "spacebar"], isFunctionKey: false),
+        KeyEntry(code: 36, canonical: "return", display: "↩", aliases: ["return", "enter"], isFunctionKey: false),
+        KeyEntry(code: 48, canonical: "tab", display: "⇥", aliases: ["tab"], isFunctionKey: false),
+        KeyEntry(code: 50, canonical: "backtick", display: "`", aliases: ["backtick", "grave", "`"], isFunctionKey: false),
+        KeyEntry(code: 27, canonical: "minus", display: "-", aliases: ["minus", "-"], isFunctionKey: false),
+        KeyEntry(code: 24, canonical: "equal", display: "=", aliases: ["equal", "equals", "="], isFunctionKey: false),
+        KeyEntry(code: 33, canonical: "leftbracket", display: "[", aliases: ["leftbracket", "["], isFunctionKey: false),
+        KeyEntry(code: 30, canonical: "rightbracket", display: "]", aliases: ["rightbracket", "]"], isFunctionKey: false),
+        KeyEntry(code: 42, canonical: "backslash", display: "\\", aliases: ["backslash", "\\"], isFunctionKey: false),
+        KeyEntry(code: 41, canonical: "semicolon", display: ";", aliases: ["semicolon", ";"], isFunctionKey: false),
+        KeyEntry(code: 39, canonical: "quote", display: "'", aliases: ["quote", "'"], isFunctionKey: false),
+        KeyEntry(code: 43, canonical: "comma", display: ",", aliases: ["comma", ","], isFunctionKey: false),
+        KeyEntry(code: 47, canonical: "period", display: ".", aliases: ["period", "."], isFunctionKey: false),
+        KeyEntry(code: 44, canonical: "slash", display: "/", aliases: ["slash", "/"], isFunctionKey: false),
+        KeyEntry(code: 123, canonical: "left", display: "←", aliases: ["left", "leftarrow"], isFunctionKey: false),
+        KeyEntry(code: 124, canonical: "right", display: "→", aliases: ["right", "rightarrow"], isFunctionKey: false),
+        KeyEntry(code: 125, canonical: "down", display: "↓", aliases: ["down", "downarrow"], isFunctionKey: false),
+        KeyEntry(code: 126, canonical: "up", display: "↑", aliases: ["up", "uparrow"], isFunctionKey: false),
+        // Letters A-Z (ANSI virtual keycodes)
+        KeyEntry(code: 0, canonical: "a", display: "A", aliases: ["a"], isFunctionKey: false),
+        KeyEntry(code: 11, canonical: "b", display: "B", aliases: ["b"], isFunctionKey: false),
+        KeyEntry(code: 8, canonical: "c", display: "C", aliases: ["c"], isFunctionKey: false),
+        KeyEntry(code: 2, canonical: "d", display: "D", aliases: ["d"], isFunctionKey: false),
+        KeyEntry(code: 14, canonical: "e", display: "E", aliases: ["e"], isFunctionKey: false),
+        KeyEntry(code: 3, canonical: "f", display: "F", aliases: ["f"], isFunctionKey: false),
+        KeyEntry(code: 5, canonical: "g", display: "G", aliases: ["g"], isFunctionKey: false),
+        KeyEntry(code: 4, canonical: "h", display: "H", aliases: ["h"], isFunctionKey: false),
+        KeyEntry(code: 34, canonical: "i", display: "I", aliases: ["i"], isFunctionKey: false),
+        KeyEntry(code: 38, canonical: "j", display: "J", aliases: ["j"], isFunctionKey: false),
+        KeyEntry(code: 40, canonical: "k", display: "K", aliases: ["k"], isFunctionKey: false),
+        KeyEntry(code: 37, canonical: "l", display: "L", aliases: ["l"], isFunctionKey: false),
+        KeyEntry(code: 46, canonical: "m", display: "M", aliases: ["m"], isFunctionKey: false),
+        KeyEntry(code: 45, canonical: "n", display: "N", aliases: ["n"], isFunctionKey: false),
+        KeyEntry(code: 31, canonical: "o", display: "O", aliases: ["o"], isFunctionKey: false),
+        KeyEntry(code: 35, canonical: "p", display: "P", aliases: ["p"], isFunctionKey: false),
+        KeyEntry(code: 12, canonical: "q", display: "Q", aliases: ["q"], isFunctionKey: false),
+        KeyEntry(code: 15, canonical: "r", display: "R", aliases: ["r"], isFunctionKey: false),
+        KeyEntry(code: 1, canonical: "s", display: "S", aliases: ["s"], isFunctionKey: false),
+        KeyEntry(code: 17, canonical: "t", display: "T", aliases: ["t"], isFunctionKey: false),
+        KeyEntry(code: 32, canonical: "u", display: "U", aliases: ["u"], isFunctionKey: false),
+        KeyEntry(code: 9, canonical: "v", display: "V", aliases: ["v"], isFunctionKey: false),
+        KeyEntry(code: 13, canonical: "w", display: "W", aliases: ["w"], isFunctionKey: false),
+        KeyEntry(code: 7, canonical: "x", display: "X", aliases: ["x"], isFunctionKey: false),
+        KeyEntry(code: 16, canonical: "y", display: "Y", aliases: ["y"], isFunctionKey: false),
+        KeyEntry(code: 6, canonical: "z", display: "Z", aliases: ["z"], isFunctionKey: false),
+        // Digits 0-9
+        KeyEntry(code: 29, canonical: "0", display: "0", aliases: ["0"], isFunctionKey: false),
+        KeyEntry(code: 18, canonical: "1", display: "1", aliases: ["1"], isFunctionKey: false),
+        KeyEntry(code: 19, canonical: "2", display: "2", aliases: ["2"], isFunctionKey: false),
+        KeyEntry(code: 20, canonical: "3", display: "3", aliases: ["3"], isFunctionKey: false),
+        KeyEntry(code: 21, canonical: "4", display: "4", aliases: ["4"], isFunctionKey: false),
+        KeyEntry(code: 23, canonical: "5", display: "5", aliases: ["5"], isFunctionKey: false),
+        KeyEntry(code: 22, canonical: "6", display: "6", aliases: ["6"], isFunctionKey: false),
+        KeyEntry(code: 26, canonical: "7", display: "7", aliases: ["7"], isFunctionKey: false),
+        KeyEntry(code: 28, canonical: "8", display: "8", aliases: ["8"], isFunctionKey: false),
+        KeyEntry(code: 25, canonical: "9", display: "9", aliases: ["9"], isFunctionKey: false),
+        // Function keys F1-F12
+        KeyEntry(code: 122, canonical: "f1", display: "F1", aliases: ["f1"], isFunctionKey: true),
+        KeyEntry(code: 120, canonical: "f2", display: "F2", aliases: ["f2"], isFunctionKey: true),
+        KeyEntry(code: 99, canonical: "f3", display: "F3", aliases: ["f3"], isFunctionKey: true),
+        KeyEntry(code: 118, canonical: "f4", display: "F4", aliases: ["f4"], isFunctionKey: true),
+        KeyEntry(code: 96, canonical: "f5", display: "F5", aliases: ["f5"], isFunctionKey: true),
+        KeyEntry(code: 97, canonical: "f6", display: "F6", aliases: ["f6"], isFunctionKey: true),
+        KeyEntry(code: 98, canonical: "f7", display: "F7", aliases: ["f7"], isFunctionKey: true),
+        KeyEntry(code: 100, canonical: "f8", display: "F8", aliases: ["f8"], isFunctionKey: true),
+        KeyEntry(code: 101, canonical: "f9", display: "F9", aliases: ["f9"], isFunctionKey: true),
+        KeyEntry(code: 109, canonical: "f10", display: "F10", aliases: ["f10"], isFunctionKey: true),
+        KeyEntry(code: 103, canonical: "f11", display: "F11", aliases: ["f11"], isFunctionKey: true),
+        KeyEntry(code: 111, canonical: "f12", display: "F12", aliases: ["f12"], isFunctionKey: true)
+    ]
+
+    private static let keyTableByName: [String: KeyEntry] = {
+        var map: [String: KeyEntry] = [:]
+        for item in allKeys {
+            map[item.canonical] = item
+            for alias in item.aliases {
+                map[alias] = item
+            }
+        }
+        return map
+    }()
+
+    private static let keyTableByCode: [UInt32: KeyEntry] = {
+        var map: [UInt32: KeyEntry] = [:]
+        for item in allKeys {
+            map[item.code] = item
+        }
+        return map
+    }()
 }
 
 private func expandTilde(_ path: String) -> String {

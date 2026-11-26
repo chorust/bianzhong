@@ -6,7 +6,8 @@ public enum DefaultTemplates {
     # Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)
     terminal: auto                # auto | ghostty | iterm | warp | kitty | wezterm | alacritty | cmux | terminal
     feishu_sensor_enabled: true   # 需在 系统设置 -> 完全磁盘访问权限 中授予 Bianzhong.app
-    notch_hud_enabled: true       # 刘海悬浮窗 (⌥Space 唤起，录屏隐身，不抢焦点)
+    notch_hud_enabled: true       # 刘海悬浮窗 (录屏隐身，不抢焦点)
+    notch_hotkey: option+space    # 全局快捷键，如 option+space | ctrl+space | cmd+shift+b | none
     max_concurrent_runs: 2
     max_causal_depth: 1
 

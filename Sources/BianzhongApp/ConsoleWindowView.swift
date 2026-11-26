@@ -190,10 +190,15 @@ private struct GeneralSettingsPane: View {
 
                         Divider()
 
-                        HStack {
-                            Text("刘海悬浮窗 (⌥Space)")
+                        HStack(spacing: 8) {
+                            Text("刘海悬浮窗")
                                 .font(.subheadline)
                             Spacer()
+                            ShortcutRecorderButton(model: model) { newHotkey in
+                                draftConfig.notchHotkey = newHotkey
+                            }
+                            .disabled(!model.notchHUDEnabled)
+
                             Button("预览") {
                                 model.notchHUD.previewDemo()
                             }
@@ -387,6 +392,11 @@ private struct GeneralSettingsPane: View {
         .onChange(of: model.notchHUDEnabled) { _, updatedNotch in
             if draftConfig.notchHUDEnabled != updatedNotch {
                 draftConfig.notchHUDEnabled = updatedNotch
+            }
+        }
+        .onChange(of: model.notchHotkey) { _, updatedHotkey in
+            if draftConfig.notchHotkey != updatedHotkey {
+                draftConfig.notchHotkey = updatedHotkey
             }
         }
     }
@@ -1087,29 +1097,61 @@ private struct WebhooksAndSecretsPane: View {
                 GroupBox("手机控制台 (Tailscale)") {
                     let ts = model.tailscaleStatus
                     let localPort = Int(model.webhookStatus.port > 0 ? model.webhookStatus.port : UInt16(clamping: whPort))
-                    let basePocket = ts.pocketURL ?? "http://127.0.0.1:\(localPort)/pocket"
-                    let pairingURL = "\(basePocket)#token=\(model.webhookToken)"
+                    let localPocket = "http://127.0.0.1:\(localPort)/pocket"
+                    let activePocket = (ts.isRunning && ts.serveEnabled) ? (ts.pocketURL ?? localPocket) : localPocket
+                    let pairingURL = "\(activePocket)#token=\(model.webhookToken)"
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 10) {
                             Circle()
-                                .fill(ts.serveEnabled ? Color.green : (ts.isRunning ? Color.blue : Color.secondary))
+                                .fill(ts.serveEnabled && ts.isRunning ? Color.green : (ts.isRunning ? Color.orange : Color.secondary))
                                 .frame(width: 8, height: 8)
                             Text(ts.installed ? (ts.dnsName ?? ts.backendState) : "未安装 Tailscale")
                                 .font(.caption.monospaced())
-                            if ts.serveEnabled {
+                            if !ts.installed {
+                                EmptyView()
+                            } else if !ts.isRunning {
+                                Text("Tailscale 未连接")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                            } else if ts.serveEnabled {
                                 Text("已映射私网 HTTPS")
                                     .font(.caption2)
                                     .foregroundStyle(.green)
+                            } else {
+                                Text("映射未开启（当前仅本机可访问）")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
                             }
                             Spacer()
                             Button(showPocketQR ? "收起二维码" : "扫码配对") {
-                                showPocketQR.toggle()
+                                if !showPocketQR && ts.installed && !ts.serveEnabled {
+                                    isTogglingTailscale = true
+                                    Task {
+                                        tailscaleMessage = await model.setTailscaleServe(enabled: true)
+                                        isTogglingTailscale = false
+                                        showPocketQR = true
+                                    }
+                                } else {
+                                    showPocketQR.toggle()
+                                }
                             }
                             .controlSize(.small)
 
                             Button("复制配对链接") {
-                                copyToPasteboard(pairingURL, concealed: true)
-                                tailscaleMessage = "✓ 已复制带令牌配对链接"
+                                if ts.installed && !ts.serveEnabled {
+                                    isTogglingTailscale = true
+                                    Task {
+                                        tailscaleMessage = await model.setTailscaleServe(enabled: true)
+                                        isTogglingTailscale = false
+                                        let refreshed = model.tailscaleStatus
+                                        let base = (refreshed.isRunning && refreshed.serveEnabled) ? (refreshed.pocketURL ?? localPocket) : localPocket
+                                        copyToPasteboard("\(base)#token=\(model.webhookToken)", concealed: true)
+                                        tailscaleMessage = "✓ 已自动开启映射并复制配对链接"
+                                    }
+                                } else {
+                                    copyToPasteboard(pairingURL, concealed: true)
+                                    tailscaleMessage = "✓ 已复制带令牌配对链接"
+                                }
                             }
                             .controlSize(.small)
 
@@ -1121,17 +1163,17 @@ private struct WebhooksAndSecretsPane: View {
                             .controlSize(.small)
 
                             if ts.installed {
-                                Button(isTogglingTailscale ? "配置中..." : (ts.serveEnabled ? "关闭映射" : "开启映射")) {
+                                Button(isTogglingTailscale ? "配置中..." : (ts.serveEnabled && ts.isRunning ? "关闭映射" : "开启映射")) {
                                     isTogglingTailscale = true
                                     Task {
-                                        let targetEnable = !ts.serveEnabled
+                                        let targetEnable = !(ts.serveEnabled && ts.isRunning)
                                         tailscaleMessage = await model.setTailscaleServe(enabled: targetEnable)
                                         isTogglingTailscale = false
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
-                                .disabled(isTogglingTailscale || !ts.isRunning)
+                                .disabled(isTogglingTailscale)
                             }
                         }
 
@@ -1151,10 +1193,10 @@ private struct WebhooksAndSecretsPane: View {
                                     .background(Color.white)
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(basePocket)
+                                    Text(activePocket)
                                         .font(.caption.monospaced())
                                         .textSelection(.enabled)
-                                    Text("手机开启 Tailscale 后扫码即可添加到主屏幕，令牌通过 URL #fragment 本地保存，不出公网。")
+                                    Text("手机开启 Tailscale（登录同一账号）后扫码即可打开并添加到主屏幕。")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                 }

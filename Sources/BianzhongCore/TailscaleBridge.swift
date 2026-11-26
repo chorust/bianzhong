@@ -93,14 +93,26 @@ public enum TailscaleBridge {
         guard let bin = resolveTailscaleBinary() else {
             return (false, TailscaleStatusInfo(installed: false), "未检测到 Tailscale 应用")
         }
-        let current = queryStatus(localPort: localPort)
+        var current = queryStatus(localPort: localPort)
         if enabled && !current.isRunning {
-            return (false, current, "请先打开 Tailscale 并登录（当前状态：\(current.backendState)）")
+            // Best-effort launch Tailscale.app and bring tunnel up automatically
+            if FileManager.default.fileExists(atPath: "/Applications/Tailscale.app") {
+                _ = runCLI("/usr/bin/open", args: ["-g", "-a", "/Applications/Tailscale.app"], timeout: 3.0)
+            }
+            _ = runCLI(bin, args: ["up"], timeout: 6.0)
+            for _ in 0..<10 {
+                current = queryStatus(localPort: localPort)
+                if current.isRunning { break }
+                Thread.sleep(forTimeInterval: 0.4)
+            }
+            if !current.isRunning {
+                return (false, current, "Tailscale 当前未连接（\(current.backendState)），请先在菜单栏打开 Tailscale 并登录")
+            }
         }
 
         if enabled {
             let target = "http://127.0.0.1:\(localPort)"
-            let res = runCLI(bin, args: ["serve", "--bg", target], timeout: 8.0)
+            let res = runCLI(bin, args: ["serve", "--bg", target], timeout: 10.0)
             let updated = queryStatus(localPort: localPort)
             if res.exitCode == 0 || updated.serveEnabled {
                 return (true, updated, "已开启私网映射：\(updated.pocketURL ?? target)")

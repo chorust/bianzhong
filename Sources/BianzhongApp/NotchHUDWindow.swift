@@ -52,6 +52,8 @@ final class NotchHUDController: ObservableObject {
     private var panel: ChimeBeamPanel?
     nonisolated(unsafe) private var hotKeyRef: EventHotKeyRef?
     nonisolated(unsafe) private var eventHandlerRef: EventHandlerRef?
+    private var registeredHotkeyCanonical: String?
+    private var recordingSuspended = false
     private var autoTuckTask: Task<Void, Never>?
     private var lastAnnouncedApprovalID: String?
     private var manuallyDismissedApprovalID: String?
@@ -68,10 +70,12 @@ final class NotchHUDController: ObservableObject {
 
     func attach(to model: AppModel) {
         self.model = model
-        if model.notchHUDEnabled {
-            registerOptionSpaceHotKey()
-        }
         syncPresentation()
+    }
+
+    func setRecordingSuspended(_ suspended: Bool) {
+        recordingSuspended = suspended
+        syncHotKeyRegistration()
     }
 
     func toggleExpandedFromHotkey() {
@@ -113,12 +117,11 @@ final class NotchHUDController: ObservableObject {
 
     func syncPresentation() {
         guard let model else { return }
+        syncHotKeyRegistration()
         guard model.notchHUDEnabled else {
-            unregisterOptionSpaceHotKey()
             hidePanel()
             return
         }
-        registerOptionSpaceHotKey()
 
         if phase == .expanded {
             if !model.activeRuns.isEmpty || !model.pendingApprovals.isEmpty {
@@ -267,11 +270,12 @@ final class NotchHUDController: ObservableObject {
         panel?.orderOut(nil)
     }
 
-    private func unregisterOptionSpaceHotKey() {
+    private func unregisterActiveHotKey() {
         if let hk = hotKeyRef {
             UnregisterEventHotKey(hk)
             hotKeyRef = nil
         }
+        registeredHotkeyCanonical = nil
     }
 
     private static func readBoundedUTF8Prefix(of url: URL, maxBytes: Int) -> String? {
@@ -284,9 +288,18 @@ final class NotchHUDController: ObservableObject {
         return String(decoding: data, as: UTF8.self)
     }
 
-    /// Registers `⌥Space` using Carbon `RegisterEventHotKey` (requires ZERO Accessibility TCC permissions!).
-    private func registerOptionSpaceHotKey() {
-        guard hotKeyRef == nil else { return }
+    /// Dynamically registers or updates the global hotkey via Carbon `RegisterEventHotKey` (requires ZERO Accessibility TCC permissions!).
+    private func syncHotKeyRegistration() {
+        guard let model, model.notchHUDEnabled, !recordingSuspended,
+              let spec = NotchHotkeySpec.parse(model.notchHotkey) else {
+            unregisterActiveHotKey()
+            return
+        }
+        if hotKeyRef != nil && registeredHotkeyCanonical == spec.canonicalString {
+            return
+        }
+        unregisterActiveHotKey()
+
         if eventHandlerRef == nil {
             var eventSpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
             let selfPtr = Unmanaged.passUnretained(self).toOpaque()
@@ -309,14 +322,17 @@ final class NotchHUDController: ObservableObject {
         }
 
         let hotKeyID = EventHotKeyID(signature: OSType(0x425A4844), id: 1) // 'BZHD'
-        RegisterEventHotKey(
-            UInt32(kVK_Space),
-            UInt32(optionKey),
+        let status = RegisterEventHotKey(
+            spec.keyCode,
+            spec.carbonModifiers,
             hotKeyID,
             GetApplicationEventTarget(),
             0,
             &hotKeyRef
         )
+        if status == noErr {
+            registeredHotkeyCanonical = spec.canonicalString
+        }
     }
 }
 
@@ -408,13 +424,15 @@ private struct NotchHUDView: View {
 
             Spacer(minLength: 4)
 
-            Text("⌥Space 审阅")
-                .font(.caption2.monospaced())
-                .foregroundStyle(.white.opacity(0.65))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.white.opacity(0.1))
-                .clipShape(Capsule())
+            if let hkLabel = NotchHotkeySpec.parse(model.notchHotkey)?.displayString {
+                Text("\(hkLabel) 审阅")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.white.opacity(0.65))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.white.opacity(0.1))
+                    .clipShape(Capsule())
+            }
         }
         .padding(.horizontal, 14)
         .padding(.top, hud.notchTopInset)
@@ -561,7 +579,8 @@ private struct NotchHUDView: View {
                     .frame(maxHeight: 150)
                 }
             } else {
-                Text("快捷键 ⌥Space 随时唤起/收起 · 将报错文件或截图拖入此处可直接触发排查")
+                let hkHint = NotchHotkeySpec.parse(model.notchHotkey).map { "快捷键 \($0.displayString) 随时唤起/收起 · " } ?? ""
+                Text("\(hkHint)将报错文件或文本拖入此处可直接触发排查")
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.65))
                     .padding(.vertical, 8)
@@ -630,6 +649,113 @@ private struct NotchHUDView: View {
             }
             await MainActor.run {
                 hud.handleDroppedItems(urls: urls, texts: texts)
+            }
+        }
+    }
+}
+
+/// Inline zero-TCC shortcut recorder button used in MenuBar Settings and Console General Settings.
+/// Click once, press any modifier + key combo (or `Delete` to clear, `Esc` to cancel).
+struct ShortcutRecorderButton: View {
+    @ObservedObject var model: AppModel
+    var onRecorded: ((String) -> Void)? = nil
+
+    @State private var isRecording = false
+    @State private var eventMonitor: Any?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button {
+                if isRecording {
+                    stopRecording()
+                } else {
+                    startRecording()
+                }
+            } label: {
+                Text(isRecording ? "按下快捷键..." : NotchHotkeySpec.displayLabel(for: model.notchHotkey))
+                    .font(.caption.monospaced())
+                    .frame(minWidth: 74)
+            }
+            .buttonStyle(.bordered)
+            .tint(isRecording ? .accentColor : nil)
+            .controlSize(.small)
+            .help("点击后直接按下新组合键（Delete 清空，Esc 取消）")
+
+            if !isRecording && model.notchHotkey.lowercased() != "option+space" {
+                Button {
+                    applyHotkey("option+space")
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .help("恢复默认快捷键 ⌥Space")
+            }
+        }
+        .onDisappear {
+            stopRecording()
+        }
+    }
+
+    private func startRecording() {
+        stopRecording()
+        isRecording = true
+        model.notchHUD.setRecordingSuspended(true)
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { event in
+            let code = event.keyCode
+            // Ignore bare modifier presses
+            if [54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(code) {
+                return nil
+            }
+            // Esc cancels recording
+            if code == 53 {
+                stopRecording()
+                return nil
+            }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let hasCmd = flags.contains(.command)
+            let hasOpt = flags.contains(.option)
+            let hasCtrl = flags.contains(.control)
+            let hasShift = flags.contains(.shift)
+
+            // Delete / ForwardDelete with no modifiers clears hotkey to `none`
+            if (code == 51 || code == 117) && !hasCmd && !hasOpt && !hasCtrl && !hasShift {
+                applyHotkey("none")
+                return nil
+            }
+
+            if let spec = NotchHotkeySpec.fromKeyEvent(
+                keyCode: code,
+                command: hasCmd,
+                option: hasOpt,
+                control: hasCtrl,
+                shift: hasShift
+            ) {
+                applyHotkey(spec.canonicalString)
+            } else {
+                NSSound.beep()
+            }
+            return nil
+        }
+    }
+
+    private func applyHotkey(_ value: String) {
+        stopRecording(restoreSuspendedOnly: false)
+        model.setNotchHotkey(value)
+        onRecorded?(value)
+    }
+
+    private func stopRecording(restoreSuspendedOnly: Bool = true) {
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
+            eventMonitor = nil
+        }
+        let wasRecording = isRecording
+        isRecording = false
+        if wasRecording {
+            model.notchHUD.setRecordingSuspended(false)
+            if !restoreSuspendedOnly {
+                model.notchHUD.syncPresentation()
             }
         }
     }

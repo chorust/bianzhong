@@ -67,6 +67,7 @@ final class AppModel: ObservableObject {
     @Published var tailscaleStatus: TailscaleStatusInfo = TailscaleStatusInfo(installed: false)
     @Published var preferredTerminal: String = "auto"
     @Published var notchHUDEnabled: Bool = true
+    @Published var notchHotkey: String = "option+space"
     @Published var todayRunsCount: Int = 0
     @Published var todayCostUSD: Double = 0.0
     @Published var paused = false
@@ -244,6 +245,7 @@ final class AppModel: ObservableObject {
         feishuEnabled = cfg.feishuSensorEnabled
         preferredTerminal = cfg.terminal
         notchHUDEnabled = cfg.notchHUDEnabled
+        notchHotkey = cfg.notchHotkey
         feishuStatus = orchestrator.feishuSensorStatus()
         feishuErrorMessage = orchestrator.feishuSensorErrorMessage()
         webhookStatus = orchestrator.webhookStatus()
@@ -288,6 +290,11 @@ final class AppModel: ObservableObject {
 
     func setNotchHUD(enabled: Bool) {
         orchestrator.setNotchHUDEnabled(enabled)
+        refresh()
+    }
+
+    func setNotchHotkey(_ hotkey: String) {
+        orchestrator.setNotchHotkey(hotkey)
         refresh()
     }
 
@@ -1060,10 +1067,12 @@ struct SettingsTabView: View {
 
                 Divider()
 
-                HStack {
-                    Text("刘海悬浮窗 (⌥Space)")
+                HStack(spacing: 8) {
+                    Text("刘海悬浮窗")
                         .font(.subheadline)
                     Spacer()
+                    ShortcutRecorderButton(model: model)
+                        .disabled(!model.notchHUDEnabled)
                     Toggle("", isOn: Binding(
                         get: { model.notchHUDEnabled },
                         set: { model.setNotchHUD(enabled: $0) }

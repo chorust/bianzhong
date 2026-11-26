@@ -506,6 +506,11 @@ public final class Orchestrator: @unchecked Sendable {
         reloadConfig()
     }
 
+    public func setNotchHotkey(_ hotkey: String) {
+        try? AppConfig.setNotchHotkey(hotkey, in: paths.configFile)
+        reloadConfig()
+    }
+
     public func tailscaleStatus() -> TailscaleStatusInfo {
         let port = webhookStatus().port > 0 ? webhookStatus().port : UInt16(clamping: currentConfig().webhookPort)
         return TailscaleBridge.queryStatus(localPort: port)
