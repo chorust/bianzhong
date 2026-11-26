@@ -54,7 +54,7 @@ session:
 
 execution:
   autonomy: draft_approve                      # observe_digest | notify | draft_approve | bounded_auto
-  driver: omp                                  # omp | codex | none (纯动作不拉大模型)
+  driver: omp-acp                              # omp-acp | opencode-acp | claude-acp | omp | claude | opencode | codex | none
   model: null
   working_dir: ~/path/to/repo                  # 支持 $payload.cwd 动态跟随触发目录
   worktree_on_phase2: true

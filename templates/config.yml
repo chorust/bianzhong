@@ -1,6 +1,7 @@
 # Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)
 terminal: auto                # auto | ghostty | iterm | warp | kitty | wezterm | alacritty | cmux | terminal
 feishu_sensor_enabled: true   # 需在 系统设置 -> 完全磁盘访问权限 中授予 Bianzhong.app
+notch_hud_enabled: true       # 刘海悬浮窗 (⌥Space 唤起，录屏隐身，不抢焦点)
 max_concurrent_runs: 2
 max_causal_depth: 1
 

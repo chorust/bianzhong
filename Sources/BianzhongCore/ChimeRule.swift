@@ -163,6 +163,7 @@ public struct AppConfig: Sendable, Equatable {
     public var agentCLIDriver: String
     public var agentCLIModel: String?
     public var terminal: String
+    public var notchHUDEnabled: Bool
     public var feishuSensorEnabled: Bool
     public var webhookServerEnabled: Bool
     public var webhookHost: String
@@ -184,6 +185,7 @@ public struct AppConfig: Sendable, Equatable {
         agentCLIDriver: String = "omp",
         agentCLIModel: String? = "smol",
         terminal: String = "auto",
+        notchHUDEnabled: Bool = true,
         feishuSensorEnabled: Bool = true,
         webhookServerEnabled: Bool = true,
         webhookHost: String = "127.0.0.1",
@@ -204,6 +206,7 @@ public struct AppConfig: Sendable, Equatable {
         self.agentCLIDriver = agentCLIDriver
         self.agentCLIModel = agentCLIModel
         self.terminal = terminal
+        self.notchHUDEnabled = notchHUDEnabled
         self.feishuSensorEnabled = feishuSensorEnabled
         self.webhookServerEnabled = webhookServerEnabled
         self.webhookHost = webhookHost
@@ -293,6 +296,7 @@ public struct AppConfig: Sendable, Equatable {
         let val = unquote(value)
         switch key {
         case "terminal": config.terminal = val
+        case "notch_hud_enabled": config.notchHUDEnabled = parseBool(val, default: config.notchHUDEnabled)
         case "feishu_sensor_enabled": config.feishuSensorEnabled = parseBool(val, default: config.feishuSensorEnabled)
         case "webhook_server_enabled": config.webhookServerEnabled = parseBool(val, default: config.webhookServerEnabled)
         case "webhook_host": config.webhookHost = val.isEmpty ? config.webhookHost : val
@@ -324,6 +328,7 @@ public struct AppConfig: Sendable, Equatable {
         var out: [String] = [
             "# Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)",
             "terminal: \(yamlScalar(config.terminal))",
+            "notch_hud_enabled: \(config.notchHUDEnabled)",
             "feishu_sensor_enabled: \(config.feishuSensorEnabled)",
             "max_concurrent_runs: \(config.maxConcurrentRuns)",
             "max_causal_depth: \(config.maxCausalDepth)",
@@ -378,6 +383,11 @@ public struct AppConfig: Sendable, Equatable {
     /// Updates or inserts `feishu_sensor_enabled` at top level inside `config.yml` without disturbing nested keys or comments.
     public static func setFeishuSensorEnabled(_ enabled: Bool, in configFile: URL) throws {
         try setTopLevelScalar(key: "feishu_sensor_enabled", renderedValue: "\(enabled)", in: configFile)
+    }
+
+    /// Updates or inserts `notch_hud_enabled` at top level inside `config.yml` without disturbing nested keys or comments.
+    public static func setNotchHUDEnabled(_ enabled: Bool, in configFile: URL) throws {
+        try setTopLevelScalar(key: "notch_hud_enabled", renderedValue: "\(enabled)", in: configFile)
     }
 
     private static func setTopLevelScalar(key: String, renderedValue: String, in configFile: URL) throws {

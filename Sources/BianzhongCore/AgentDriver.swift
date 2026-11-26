@@ -315,6 +315,261 @@ public struct CodexDriver: AgentDriver {
     }
 }
 
+/// Driver for Anthropic Claude Code CLI (`claude -p --output-format stream-json --verbose`).
+public struct ClaudeDriver: AgentDriver {
+    public let id = "claude"
+    private let executablePath: String
+
+    public init(executablePath: String? = nil) {
+        self.executablePath = executablePath ?? AgentDriverRegistry.resolveBinary(name: "claude") ?? "/opt/homebrew/bin/claude"
+    }
+
+    public func buildSpawnSpec(request: AgentInvocationRequest) -> SpawnSpec {
+        var args: [String] = ["-p", "--output-format", "stream-json", "--verbose"]
+
+        if let resumeID = request.resumeSessionID, !resumeID.isEmpty {
+            args += ["--resume", resumeID]
+        }
+
+        switch request.permissionProfile {
+        case .noTools:
+            args += ["--permission-mode", "plan", "--tools", ""]
+        case .readOnly:
+            args += ["--permission-mode", "plan", "--tools", "Read,Glob,Grep"]
+        case .workspaceRW:
+            args += ["--permission-mode", "acceptEdits"]
+        }
+
+        if let model = request.modelOverride, !model.isEmpty {
+            args += ["--model", model]
+        }
+        if let cost = request.maxCostUSD, cost > 0 {
+            args += ["--max-budget-usd", String(format: "%.2f", cost)]
+        }
+
+        let env = [
+            "BIANZHONG_RUN_ID": request.runID,
+            "BIANZHONG_EVENT_FILE": request.eventFilePath,
+            "BIANZHONG_CORRELATION_KEY": request.correlationKey,
+            "BIANZHONG_DEPTH": "1"
+        ]
+
+        return SpawnSpec(
+            executablePath: executablePath,
+            arguments: args,
+            environment: env,
+            stdinData: request.promptText.data(using: .utf8),
+            workingDirectory: request.workingDirectory
+        )
+    }
+
+    public func parseStdoutLine(_ line: String) -> [NormalizedAgentEvent] {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = obj["type"] as? String else {
+            return []
+        }
+
+        var events: [NormalizedAgentEvent] = []
+        switch type {
+        case "system":
+            if let sid = obj["session_id"] as? String, !sid.isEmpty {
+                events.append(.sessionStarted(externalSessionID: sid))
+            }
+        case "assistant":
+            if let msg = obj["message"] as? [String: Any],
+               let blocks = msg["content"] as? [[String: Any]] {
+                for b in blocks {
+                    let bType = (b["type"] as? String) ?? ""
+                    if bType == "text", let txt = b["text"] as? String, !txt.isEmpty {
+                        events.append(.textDelta(chunk: txt))
+                    } else if bType == "tool_use", let name = b["name"] as? String {
+                        events.append(.toolActivity(name: name, status: "running"))
+                    }
+                }
+            }
+        case "result":
+            if let sid = obj["session_id"] as? String, !sid.isEmpty {
+                events.append(.sessionStarted(externalSessionID: sid))
+            }
+            if let resText = obj["result"] as? String, !resText.isEmpty {
+                events.append(.finalAnswer(text: resText))
+            }
+            let cost = obj["total_cost_usd"] as? Double
+            let usage = obj["usage"] as? [String: Any]
+            let inTok = usage?["input_tokens"] as? Int ?? 0
+            let outTok = usage?["output_tokens"] as? Int ?? 0
+            let cacheTok = usage?["cache_read_input_tokens"] as? Int ?? 0
+            events.append(.usageReported(input: inTok, output: outTok, cached: cacheTok, costUSD: cost))
+        default:
+            break
+        }
+        return events
+    }
+
+    public func isSuccessExit(exitCode: Int32, lastEvents: [NormalizedAgentEvent]) -> Bool {
+        exitCode == 0
+    }
+
+    public func buildTakeoverCommand(sessionID: String, sessionDir: String, workingDirectory: String) -> String {
+        "cd \(shellQuote(workingDirectory)) && \(shellQuote(executablePath)) --resume \(shellQuote(sessionID))"
+    }
+}
+
+/// Driver for OpenCode CLI (`opencode run --format json`).
+public struct OpenCodeDriver: AgentDriver {
+    public let id = "opencode"
+    private let executablePath: String
+
+    public init(executablePath: String? = nil) {
+        self.executablePath = executablePath ?? AgentDriverRegistry.resolveBinary(name: "opencode") ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.opencode/bin/opencode"
+    }
+
+    public func buildSpawnSpec(request: AgentInvocationRequest) -> SpawnSpec {
+        var args: [String] = ["run", "--format", "json"]
+        switch request.permissionProfile {
+        case .noTools, .readOnly:
+            args += ["--agent", "plan"]
+        case .workspaceRW:
+            args.append("--auto")
+        }
+        if let resumeID = request.resumeSessionID, !resumeID.isEmpty {
+            args += ["--session", resumeID]
+        }
+        if let model = request.modelOverride, !model.isEmpty {
+            args += ["--model", model]
+        }
+        args.append(request.promptText)
+
+        let env = [
+            "BIANZHONG_RUN_ID": request.runID,
+            "BIANZHONG_EVENT_FILE": request.eventFilePath,
+            "BIANZHONG_CORRELATION_KEY": request.correlationKey,
+            "BIANZHONG_DEPTH": "1"
+        ]
+        return SpawnSpec(
+            executablePath: executablePath,
+            arguments: args,
+            environment: env,
+            workingDirectory: request.workingDirectory
+        )
+    }
+
+    public func parseStdoutLine(_ line: String) -> [NormalizedAgentEvent] {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        var out: [NormalizedAgentEvent] = []
+        if let sid = (obj["sessionID"] as? String) ?? (obj["session_id"] as? String), !sid.isEmpty {
+            out.append(.sessionStarted(externalSessionID: sid))
+        }
+        let type = (obj["type"] as? String) ?? ""
+        if type == "text", let part = obj["part"] as? [String: Any], let txt = part["text"] as? String, !txt.isEmpty {
+            out.append(.textDelta(chunk: txt))
+        } else if type == "tool_use", let part = obj["part"] as? [String: Any], let tool = part["tool"] as? String {
+            out.append(.toolActivity(name: tool, status: "running"))
+        } else if type == "step_finish", let part = obj["part"] as? [String: Any] {
+            let cost = part["cost"] as? Double
+            let tokens = part["tokens"] as? [String: Any]
+            let inTok = tokens?["input"] as? Int ?? 0
+            let outTok = tokens?["output"] as? Int ?? 0
+            let cacheTok = (tokens?["cache"] as? [String: Any])?["read"] as? Int ?? 0
+            if inTok > 0 || outTok > 0 || cacheTok > 0 || cost != nil {
+                out.append(.usageReported(input: inTok, output: outTok, cached: cacheTok, costUSD: cost))
+            }
+        }
+        return out
+    }
+
+    public func isSuccessExit(exitCode: Int32, lastEvents: [NormalizedAgentEvent]) -> Bool {
+        exitCode == 0
+    }
+
+    public func buildTakeoverCommand(sessionID: String, sessionDir: String, workingDirectory: String) -> String {
+        "cd \(shellQuote(workingDirectory)) && \(shellQuote(executablePath)) --session \(shellQuote(sessionID))"
+    }
+}
+
+/// Universal Agent Client Protocol (ACP) driver (`omp --mode=acp`, `opencode acp`, `gemini --acp`, `claude-agent-acp`).
+public struct AcpAgentDriver: AgentDriver {
+    public let id: String
+    public let executablePath: String
+    public let acpArguments: [String]
+    private let takeoverTemplate: @Sendable (_ exe: String, _ sid: String, _ sessionDir: String, _ cwd: String) -> String
+
+    public init(id: String, executablePath: String, acpArguments: [String] = []) {
+        self.id = id
+        self.executablePath = executablePath
+        self.acpArguments = acpArguments
+        self.takeoverTemplate = { bin, sid, _, cwd in
+            "cd \(shellQuote(cwd)) && \(shellQuote(bin)) --resume \(shellQuote(sid))"
+        }
+    }
+
+    public init(id: String) {
+        self.id = id
+        switch id.lowercased() {
+        case "opencode-acp":
+            let exe = AgentDriverRegistry.resolveBinary(name: "opencode") ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.opencode/bin/opencode"
+            self.executablePath = exe
+            self.acpArguments = ["acp"]
+            self.takeoverTemplate = { bin, sid, _, cwd in
+                "cd \(shellQuote(cwd)) && \(shellQuote(bin)) --session \(shellQuote(sid))"
+            }
+        case "gemini-acp":
+            let exe = AgentDriverRegistry.resolveBinary(name: "gemini") ?? "/opt/homebrew/bin/gemini"
+            self.executablePath = exe
+            self.acpArguments = ["--acp"]
+            self.takeoverTemplate = { bin, _, _, cwd in
+                "cd \(shellQuote(cwd)) && \(shellQuote(bin))"
+            }
+        case "claude-acp":
+            let exe = AgentDriverRegistry.resolveBinary(name: "claude-agent-acp") ?? "claude-agent-acp"
+            self.executablePath = exe
+            self.acpArguments = []
+            self.takeoverTemplate = { _, sid, _, cwd in
+                let claudeBin = AgentDriverRegistry.resolveBinary(name: "claude") ?? "claude"
+                return "cd \(shellQuote(cwd)) && \(shellQuote(claudeBin)) --resume \(shellQuote(sid))"
+            }
+        default:
+            // Default ACP backend: `omp --mode=acp`
+            let exe = AgentDriverRegistry.resolveBinary(name: "omp") ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.local/bin/omp"
+            self.executablePath = exe
+            self.acpArguments = ["--mode=acp"]
+            self.takeoverTemplate = { bin, sid, sdir, cwd in
+                "cd \(shellQuote(cwd)) && \(shellQuote(bin)) -r \(shellQuote(sid)) --session-dir \(shellQuote(sdir))"
+            }
+        }
+    }
+
+    public func buildAcpSpawnSpec(request: AgentInvocationRequest) -> SpawnSpec {
+        let env = [
+            "BIANZHONG_RUN_ID": request.runID,
+            "BIANZHONG_EVENT_FILE": request.eventFilePath,
+            "BIANZHONG_CORRELATION_KEY": request.correlationKey,
+            "BIANZHONG_DEPTH": "1"
+        ]
+        return SpawnSpec(
+            executablePath: executablePath,
+            arguments: acpArguments,
+            environment: env,
+            workingDirectory: request.workingDirectory
+        )
+    }
+
+    public func buildSpawnSpec(request: AgentInvocationRequest) -> SpawnSpec {
+        buildAcpSpawnSpec(request: request)
+    }
+
+    public func parseStdoutLine(_ line: String) -> [NormalizedAgentEvent] { [] }
+    public func isSuccessExit(exitCode: Int32, lastEvents: [NormalizedAgentEvent]) -> Bool { exitCode == 0 }
+
+    public func buildTakeoverCommand(sessionID: String, sessionDir: String, workingDirectory: String) -> String {
+        takeoverTemplate(executablePath, sessionID, sessionDir, workingDirectory)
+    }
+}
+
 public enum AgentDriverRegistry {
     private final class RegistryStorage: @unchecked Sendable {
         let lock = NSLock()
@@ -343,9 +598,23 @@ public enum AgentDriverRegistry {
         switch key {
         case "codex":
             return CodexDriver()
+        case "claude":
+            return ClaudeDriver()
+        case "opencode":
+            return OpenCodeDriver()
+        case "acp", "omp-acp", "opencode-acp", "claude-acp", "gemini-acp":
+            return AcpAgentDriver(id: key == "acp" ? "omp-acp" : key)
         default:
             return OmpDriver()
         }
+    }
+
+    public static func isAcpDriverName(_ name: String) -> Bool {
+        let k = name.lowercased()
+        if storage.lock.withLock({ storage.customDrivers[k] }) is AcpAgentDriver {
+            return true
+        }
+        return k == "acp" || k.hasSuffix("-acp")
     }
 
     public static func resolveBinary(name: String) -> String? {
@@ -353,6 +622,9 @@ public enum AgentDriverRegistry {
         let home = fm.homeDirectoryForCurrentUser.path
         let candidates = [
             "\(home)/.local/bin/\(name)",
+            "\(home)/.opencode/bin/\(name)",
+            "\(home)/.bun/bin/\(name)",
+            "\(home)/.cargo/bin/\(name)",
             "/opt/homebrew/bin/\(name)",
             "/usr/local/bin/\(name)"
         ]
@@ -380,19 +652,78 @@ public struct ProcessRunResult: Sendable {
     public let stderr: String
 }
 
+public final class ActiveProcessHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pid: pid_t = -1
+    private var reaped = false
+    private var cancelledFlag = false
+
+    public var isCancelled: Bool {
+        lock.withLock { cancelledFlag }
+    }
+
+    public init() {}
+
+    func bind(pid: pid_t) {
+        let shouldKillImmediately = lock.withLock { () -> Bool in
+            self.pid = pid
+            self.reaped = false
+            return self.cancelledFlag
+        }
+        if shouldKillImmediately && pid > 0 {
+            kill(-pid, SIGTERM)
+        }
+    }
+
+    func markReaped() {
+        lock.withLock {
+            reaped = true
+        }
+    }
+
+    private func shouldSendSIGKILL(to targetPID: pid_t) -> Bool {
+        lock.withLock {
+            !reaped && pid == targetPID && targetPID > 0
+        }
+    }
+
+    public func cancel() {
+        let (targetPID, alive): (pid_t, Bool) = lock.withLock {
+            cancelledFlag = true
+            return (pid, !reaped)
+        }
+        guard alive && targetPID > 0 else { return }
+        kill(-targetPID, SIGTERM)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, self.shouldSendSIGKILL(to: targetPID) else { return }
+            kill(-targetPID, SIGKILL)
+        }
+    }
+}
+
 /// Spawns external agent subprocesses in an isolated process group (`pgid == pid`)
-/// with bounded wall-clock execution and clean `SIGTERM -> SIGKILL` group teardown.
+/// with bounded wall-clock execution, live line-stream callbacks, and clean `SIGTERM -> SIGKILL` group teardown.
 public enum AgentProcessRunner {
-    public static func run(spec: SpawnSpec, timeoutSeconds: Int) async -> ProcessRunResult {
+    public static func run(
+        spec: SpawnSpec,
+        timeoutSeconds: Int,
+        handle: ActiveProcessHandle? = nil,
+        onStdoutLine: (@Sendable (String) -> Void)? = nil
+    ) async -> ProcessRunResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let result = runSync(spec: spec, timeoutSeconds: timeoutSeconds)
+                let result = runSync(spec: spec, timeoutSeconds: timeoutSeconds, handle: handle, onStdoutLine: onStdoutLine)
                 continuation.resume(returning: result)
             }
         }
     }
 
-    private static func runSync(spec: SpawnSpec, timeoutSeconds: Int) -> ProcessRunResult {
+    private static func runSync(
+        spec: SpawnSpec,
+        timeoutSeconds: Int,
+        handle: ActiveProcessHandle?,
+        onStdoutLine: (@Sendable (String) -> Void)?
+    ) -> ProcessRunResult {
         var tempPromptPath: String?
         if let promptText = spec.promptFileText {
             let path = FileManager.default.temporaryDirectory
@@ -505,6 +836,7 @@ public enum AgentProcessRunner {
                 stderr: "posix_spawn failed (\(spawnRC)): \(String(cString: strerror(spawnRC)))"
             )
         }
+        handle?.bind(pid: pid)
 
         final class DataBox: @unchecked Sendable {
             var value = Data()
@@ -517,7 +849,7 @@ public enum AgentProcessRunner {
         let stdoutReadFD = stdoutPipe[0]
         group.enter()
         DispatchQueue.global(qos: .utility).async {
-            stdoutBox.value = readAllFD(stdoutReadFD)
+            stdoutBox.value = readStreamingFD(stdoutReadFD, onLine: onStdoutLine)
             close(stdoutReadFD)
             group.leave()
         }
@@ -566,6 +898,7 @@ public enum AgentProcessRunner {
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
+        handle?.markReaped()
 
         _ = group.wait(timeout: .now() + 2.0)
 
@@ -586,6 +919,36 @@ public enum AgentProcessRunner {
             stdout: String(data: stdoutBox.value, encoding: .utf8) ?? "",
             stderr: String(data: stderrBox.value, encoding: .utf8) ?? ""
         )
+    }
+
+    private static func readStreamingFD(_ fd: Int32, onLine: (@Sendable (String) -> Void)?) -> Data {
+        var total = Data()
+        var lineBuffer = Data()
+        var buf = [UInt8](repeating: 0, count: 8192)
+        while true {
+            let n = Darwin.read(fd, &buf, buf.count)
+            if n > 0 {
+                total.append(buf, count: n)
+                if let onLine {
+                    lineBuffer.append(buf, count: n)
+                    while let nl = lineBuffer.firstIndex(of: 0x0A) {
+                        let lineData = lineBuffer.subdata(in: 0..<nl)
+                        lineBuffer.removeSubrange(0...nl)
+                        if let lineStr = String(data: lineData, encoding: .utf8), !lineStr.isEmpty {
+                            onLine(lineStr)
+                        }
+                    }
+                }
+            } else if n < 0 && errno == EINTR {
+                continue
+            } else {
+                break
+            }
+        }
+        if let onLine, !lineBuffer.isEmpty, let tail = String(data: lineBuffer, encoding: .utf8), !tail.isEmpty {
+            onLine(tail)
+        }
+        return total
     }
 
     private static func readAllFD(_ fd: Int32) -> Data {

@@ -12,29 +12,27 @@
 
 *Every signal, a call to action.*
 
-Bianzhong（编钟）连接本机事件源与你自备的 CLI Agent（如 `omp`、`codex`）。所有事件过滤、SQLite 状态记录和子进程调度均在本地完成，不依赖中转服务，也不自研 Agent Harness 或修改上游 Agent 源码。
+Bianzhong（编钟）连接本机事件源与你自备的 CLI / ACP Agent（如 `omp-acp`、`opencode-acp`、`claude`、`opencode`、`omp`、`codex`）。所有事件过滤、SQLite 状态记录和子进程调度均在本地完成，不依赖公网中转服务，也不修改上游 Agent 源码。
 
-项目采用单应用形态打包：一个 `Bianzhong.app` 同时承担菜单栏听音台、守护进程、内置飞书通知监听和内嵌 `bz` 命令行工具；首次打开时自动初始化默认配置并将 `bz` 软链到常用 `PATH` 目录。**剪贴板监听、工作区 FSEvents 监听、内置 Cron 调度与 LaunchAgent 开机自启尚未实现**，属于后续里程碑；当前版本聚焦飞书通知中心读取、Zsh 慢命令失败钩子与 `bz emit` 脚本接入。
+项目采用单应用形态打包：一个 `Bianzhong.app` 同时承担菜单栏待办与规则中心、刘海悬浮窗「编钟梁」（`⌥Space`）、统一控制台、Tailscale 手机口袋控制台 PWA、内置飞书通知监听及内嵌 `bz` 命令行工具；首次打开时自动初始化默认配置并将 `bz` 软链到常用 `PATH` 目录。
 
 <p align="center">
   <a href="docs/00-mvp-architecture-and-roadmap.md">架构与路线图</a> · <a href="docs/research/01-macos-perception-and-hammerspoon2.md">macOS 感知调研</a><br>
   <a href="docs/research/03-agent-dispatch-and-lifecycle.md">Agent 调度机制</a> · <a href="docs/research/04-trigger-funnel-permissions-and-hitl.md">触发漏斗与审批</a>
 </p>
 
-最新已发布版本为 **v0.3.0**（macOS 26 Apple Silicon 单应用预览版）；下方安装示例对应 GitHub Release 上的 **v0.3.0** 产物。
+最新已发布版本为 **v0.5.0**（macOS 26 Apple Silicon 单应用版）；下方安装示例对应 GitHub Release 上的 **v0.5.0** 产物。
 
 [Features](#features) · [Screenshots](#screenshots) · [Install](#install) · [Usage](#usage) · [项目与许可](#项目与许可) · [Dev](#dev)
 
 ## Features
 
-- 单应用开箱即用：`Bianzhong.app` 内置 `bz` 命令行与飞书通知监听，启动时自动把 `bz` 软链到 `~/.local/bin/bz`（如 `/opt/homebrew/bin` 可写也会一并创建），并在菜单栏「规则 / 设置」标签页中可视化管理规则启停、在线测试与 `~/.zshrc` 钩子。
-- 多源本地信号接入：内置传感器只读查询 `usernoted` 中的 `com.electron.lark` 飞书通知（缺权限时自动引导开启完全磁盘访问权限）；Zsh 慢命令钩子自动上报耗时失败命令；外部脚本经 `bz emit` 或 Unix Domain Socket `ingest.sock` 推送事件。
-- L0 确定性漏斗与窗口看门狗：`restricted` 隐私事件落库前直接丢弃；通过因果深度、自源排除、写路径租约与回声指纹阻断循环触发；支持按 `title` / `subtitle` / `body` / `cwd` 分字段匹配与 AND 组合、时间窗口累计次数阈值（如 `min_count: 2` + `window: daily`）、预期窗口未收到信号告警（`expect`）、TTL 去重、尾随防抖合并及冷却锁，这一层不调用大模型。
-- 可选 L1 语义分诊：支持 macOS 26 本地 `FoundationModels`（`apple_fm`）、指定轻量模型的 `omp` / `codex`（`agent_cli`）、外部 HTTP 接口（`decision_api`）以及直通放行（`none`）。
-- 两阶段 Agent 调度：按需通过 `posix_spawn` 在独立进程组拉起 `omp` 或 `codex`，空闲时无常驻进程；Phase 1 限制只读工具集或 `read-only` 沙箱完成勘察与拟稿，批准后再进入可写模式的 Phase 2，并可为修复任务创建独立 Git Worktree。
-- 菜单栏与交互通知审批：通过 `Bianzhong.app` 听音台与 `UNUserNotificationCenter` 通知按钮完成后台批准、附言执行、复制回复并唤起飞书，或在 Ghostty、iTerm2、Warp、Terminal 中直接接管原会话（`omp -r` / `codex resume`）；专注或锁屏期间的信号可暂存，解锁后合并为单条摘要。
-- 后置动作与运行治理：`on_complete` 按 `when` 条件触发 `notify`、`webhook`、`shortcut`、`append_markdown`、`shell`、`clipboard` 与 `chime_sound`；内置日度花费和运行次数上限、连续失败熔断，以及保护未提交改动的 Worktree 清理。
-- 离线试跑与误报调优：`bz simulate` 支持单条信号试跑，`bz replay` 重放历史事件，`bz tune` 导出被忽略样本并拉起配置助手收紧规则。
+- 单应用开箱即用：`Bianzhong.app` 内置 `bz` 命令行、统一控制台（`⌘,`）与飞书通知监听，支持开机自启与默认终端选择（Ghostty、iTerm2、Warp、Kitty、WezTerm、Alacritty、cmux、Terminal）。
+- ACP 双向流式引擎与原地热挂起：原生实现 Agent Client Protocol (`stdio` JSON-RPC 2.0)，支持 `omp-acp`、`opencode-acp`、`claude-acp`、`gemini-acp` 实时流式推送与 `session/request_permission` **原地热挂起（Warm-Hold）**——人类批准后 `<5ms` 原地继续执行，也支持行内输入调整意见（`Steer`）或一键中止运行；同时兼容 `claude`、`opencode`、`omp`、`codex` CLI 驱动。
+- 刘海悬浮胶囊 HUD「编钟梁」：零辅助功能 TCC 权限占用全局快捷键 `⌥Space`，不抢当前编辑器焦点且投屏/录屏自动隐身（`sharingType = .none`）；自动避让 MacBook 物理刘海，支持彩色 Diff 审阅、回车批准 / 输入重调、拖拽文件投喂诊断，以及一键移交至 **T3 Code / Cursor / Zed / VS Code** 或默认终端。
+- Tailscale 手机口袋控制台 PWA：内置深色移动端 Web 控制台（`/pocket`），在控制台「集成」页一键开启 `tailscale serve` 私网 HTTPS 映射并扫码配对，即可在手机端随时查看实时流与 Diff、批准/重调/忽略待办或紧急停止全部任务。
+- 多源信号与双向 Webhook 网关：内置只读飞书通知中心监听、Zsh 慢命令失败钩子、入站 HTTP Webhook（`/v1/emit`、`/v1/hooks/{github|feishu|sentry|grafana}`）、`bianzhong://` URL Scheme，以及带 HMAC 签名的飞书/Slack/Bark/Discord/Telegram 出站卡片回调。
+- L0 确定性漏斗与运行治理：`restricted` 隐私事件落库前直接丢弃；四层防自激循环（因果深度、自源排除、写路径租约、回声指纹）；支持分字段 AND 匹配、累计次数阈值、预期窗口看门狗（`expect`）、可选 L1 端侧语义分诊（`apple_fm`）、日预算/并发上限、连续失败熔断与隔离 Git Worktree 保护。
 
 ## Screenshots
 
@@ -65,11 +63,11 @@ Bianzhong（编钟）连接本机事件源与你自备的 CLI Agent（如 `omp`�
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/Bianzhong-0.3.0-macos26-arm64.tar.gz
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.5.0/Bianzhong-0.5.0-macos26-arm64.tar.gz
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.5.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-tar -xzf Bianzhong-0.3.0-macos26-arm64.tar.gz
-cp -R "Bianzhong-0.3.0/Bianzhong.app" /Applications/
+tar -xzf Bianzhong-0.5.0-macos26-arm64.tar.gz
+cp -R "Bianzhong-0.5.0/Bianzhong.app" /Applications/
 open /Applications/Bianzhong.app
 ```
 
@@ -82,10 +80,10 @@ open /Applications/Bianzhong.app
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/Bianzhong-0.3.0-macos26-arm64.pkg
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.5.0/Bianzhong-0.5.0-macos26-arm64.pkg
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.5.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-sudo installer -pkg Bianzhong-0.3.0-macos26-arm64.pkg -target /
+sudo installer -pkg Bianzhong-0.5.0-macos26-arm64.pkg -target /
 ```
 
 未配置 Apple Developer ID 公证时，首次打开预编译包若遇到 Gatekeeper 提示，确认校验和无误后执行：

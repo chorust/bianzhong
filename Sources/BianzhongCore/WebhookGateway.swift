@@ -553,14 +553,22 @@ public struct HTTPWebhookResponse: Sendable {
     public let statusCode: Int
     public let contentType: String
     public let body: Data
+    public let extraHeaders: [String: String]
 
-    public static func json(_ status: Int, _ dict: [String: Any]) -> HTTPWebhookResponse {
-        let data = (try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])) ?? Data("{}".utf8)
-        return HTTPWebhookResponse(statusCode: status, contentType: "application/json; charset=utf-8", body: data)
+    public init(statusCode: Int, contentType: String, body: Data, extraHeaders: [String: String] = [:]) {
+        self.statusCode = statusCode
+        self.contentType = contentType
+        self.body = body
+        self.extraHeaders = extraHeaders
     }
 
-    public static func html(_ status: Int, _ htmlString: String) -> HTTPWebhookResponse {
-        HTTPWebhookResponse(statusCode: status, contentType: "text/html; charset=utf-8", body: Data(htmlString.utf8))
+    public static func json(_ status: Int, _ dict: [String: Any], extraHeaders: [String: String] = [:]) -> HTTPWebhookResponse {
+        let data = (try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])) ?? Data("{}".utf8)
+        return HTTPWebhookResponse(statusCode: status, contentType: "application/json; charset=utf-8", body: data, extraHeaders: extraHeaders)
+    }
+
+    public static func html(_ status: Int, _ htmlString: String, extraHeaders: [String: String] = [:]) -> HTTPWebhookResponse {
+        HTTPWebhookResponse(statusCode: status, contentType: "text/html; charset=utf-8", body: Data(htmlString.utf8), extraHeaders: extraHeaders)
     }
 }
 
@@ -574,6 +582,8 @@ public final class WebhookServer: @unchecked Sendable {
     private let onEmit: @Sendable (EventEnvelope) -> (ok: Bool, disposition: String)
     private let onInspectApproval: @Sendable (_ id: String) -> (pending: Bool, title: String)?
     private let onResolveApproval: @Sendable (_ id: String, _ approve: Bool, _ comment: String?) -> Bool
+    private let onPocketState: @Sendable () -> Data
+    private let onPocketAction: @Sendable ([String: Any]) -> (ok: Bool, message: String)
 
     private let queue = DispatchQueue(label: "dev.bianzhong.webhook-http", qos: .userInitiated, attributes: .concurrent)
     private let connectionSemaphore = DispatchSemaphore(value: 16)
@@ -587,7 +597,9 @@ public final class WebhookServer: @unchecked Sendable {
         tokenProvider: @escaping @Sendable () -> String,
         onEmit: @escaping @Sendable (EventEnvelope) -> (ok: Bool, disposition: String),
         onInspectApproval: @escaping @Sendable (_ id: String) -> (pending: Bool, title: String)? = { _ in (true, "Bianzhong Approval") },
-        onResolveApproval: @escaping @Sendable (_ id: String, _ approve: Bool, _ comment: String?) -> Bool
+        onResolveApproval: @escaping @Sendable (_ id: String, _ approve: Bool, _ comment: String?) -> Bool,
+        onPocketState: @escaping @Sendable () -> Data = { Data("{}".utf8) },
+        onPocketAction: @escaping @Sendable ([String: Any]) -> (ok: Bool, message: String) = { _ in (false, "Unsupported") }
     ) {
         self.host = host
         self.requestedPort = port
@@ -595,6 +607,8 @@ public final class WebhookServer: @unchecked Sendable {
         self.onEmit = onEmit
         self.onInspectApproval = onInspectApproval
         self.onResolveApproval = onResolveApproval
+        self.onPocketState = onPocketState
+        self.onPocketAction = onPocketAction
     }
 
     deinit {
@@ -726,8 +740,42 @@ public final class WebhookServer: @unchecked Sendable {
             return .json(200, ["ok": true, "service": "bianzhong", "port": Int(boundPort)])
         }
 
+        // Static Mobile Pocket Console PWA shell (all data endpoints under /v1/pocket/* require Bearer header)
+        if req.method == "GET" {
+            let secHeaders = ["X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff"]
+            switch req.path {
+            case "/pocket", "/pocket/":
+                return .html(200, PocketConsoleAssets.indexHTML, extraHeaders: secHeaders)
+            case "/pocket/manifest.json":
+                return HTTPWebhookResponse(statusCode: 200, contentType: "application/manifest+json; charset=utf-8", body: Data(PocketConsoleAssets.manifestJSON.utf8), extraHeaders: secHeaders)
+            case "/pocket/sw.js":
+                return HTTPWebhookResponse(statusCode: 200, contentType: "application/javascript; charset=utf-8", body: Data(PocketConsoleAssets.serviceWorkerJS.utf8), extraHeaders: secHeaders)
+            case "/pocket/icon.svg":
+                return HTTPWebhookResponse(statusCode: 200, contentType: "image/svg+xml; charset=utf-8", body: Data(PocketConsoleAssets.iconSVG.utf8), extraHeaders: secHeaders)
+            default:
+                break
+            }
+        }
+
         let secretToken = tokenProvider()
         let pathParts = req.path.split(separator: "/").map(String.init)
+
+        // Pocket API routes enforce strict Header-only Bearer auth (rejecting query ?token= for CSRF defense) + no-store
+        if req.path == "/v1/pocket/state" || req.path == "/v1/pocket/act" {
+            let pocketHeaders = ["Cache-Control": "no-store", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff"]
+            guard isHeaderBearerAuthorized(req: req, secretToken: secretToken) else {
+                return .json(401, ["ok": false, "error": "Unauthorized (Bearer header required)"], extraHeaders: pocketHeaders)
+            }
+            if req.method == "GET" && req.path == "/v1/pocket/state" {
+                return HTTPWebhookResponse(statusCode: 200, contentType: "application/json; charset=utf-8", body: onPocketState(), extraHeaders: pocketHeaders)
+            }
+            if req.method == "POST" && req.path == "/v1/pocket/act" {
+                let obj = (try? JSONSerialization.jsonObject(with: req.body) as? [String: Any]) ?? [:]
+                let out = onPocketAction(obj)
+                return .json(out.ok ? 200 : 400, ["ok": out.ok, "message": out.message], extraHeaders: pocketHeaders)
+            }
+            return .json(405, ["ok": false, "error": "Method not allowed"], extraHeaders: pocketHeaders)
+        }
 
         // Approval callback route: /v1/approvals/:id/approve|reject
         // Note: GET/HEAD never mutates state so IM link-preview unfurl bots cannot auto-trigger Phase 2!
@@ -849,6 +897,24 @@ public final class WebhookServer: @unchecked Sendable {
         }
 
         return .json(404, ["ok": false, "error": "Unknown route: \(req.path)"])
+    }
+
+    private func isHeaderBearerAuthorized(req: HTTPWebhookRequest, secretToken: String) -> Bool {
+        guard !secretToken.isEmpty else { return false }
+        if let auth = req.headers["authorization"] {
+            let trimmed = auth.trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix("bearer ") {
+                let candidate = String(trimmed.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+                if OutboundWebhookBuilder.constantTimeEquals(candidate, secretToken) {
+                    return true
+                }
+            }
+        }
+        if let headerTok = req.headers["x-bianzhong-token"],
+           OutboundWebhookBuilder.constantTimeEquals(headerTok, secretToken) {
+            return true
+        }
+        return false
     }
 
     private func isAuthorized(req: HTTPWebhookRequest, secretToken: String) -> Bool {
@@ -993,14 +1059,18 @@ public final class WebhookServer: @unchecked Sendable {
         default: reason = "Server Error"
         }
 
-        let head = [
+        var headLines = [
             "HTTP/1.1 \(response.statusCode) \(reason)",
             "Content-Type: \(response.contentType)",
             "Content-Length: \(response.body.count)",
-            "Connection: close",
-            "",
-            ""
-        ].joined(separator: "\r\n")
+            "Connection: close"
+        ]
+        for (hk, hv) in response.extraHeaders.sorted(by: { $0.key < $1.key }) {
+            headLines.append("\(hk): \(hv)")
+        }
+        headLines.append("")
+        headLines.append("")
+        let head = headLines.joined(separator: "\r\n")
 
         var packet = Data(head.utf8)
         packet.append(response.body)

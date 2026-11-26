@@ -6,6 +6,7 @@ public enum DefaultTemplates {
     # Bianzhong（编钟）全局配置 (~/.config/bianzhong/config.yml)
     terminal: auto                # auto | ghostty | iterm | warp | kitty | wezterm | alacritty | cmux | terminal
     feishu_sensor_enabled: true   # 需在 系统设置 -> 完全磁盘访问权限 中授予 Bianzhong.app
+    notch_hud_enabled: true       # 刘海悬浮窗 (⌥Space 唤起，录屏隐身，不抢焦点)
     max_concurrent_runs: 2
     max_causal_depth: 1
 
@@ -96,7 +97,7 @@ public enum DefaultTemplates {
 
     execution:
       autonomy: draft_approve                      # observe_digest | notify | draft_approve | bounded_auto
-      driver: omp                                  # omp | codex | none (纯动作不拉大模型)
+      driver: omp-acp                              # omp-acp | opencode-acp | claude-acp | omp | claude | opencode | codex | none
       model: null
       working_dir: ~/path/to/repo                  # 支持 $payload.cwd 动态跟随触发目录
       worktree_on_phase2: true

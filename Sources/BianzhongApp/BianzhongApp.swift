@@ -5,7 +5,7 @@ import Foundation
 import SwiftUI
 
 enum MenuBarTab: String, CaseIterable, Identifiable {
-    case inbox = "听音台"
+    case inbox = "待办"
     case rules = "规则"
     case settings = "设置"
 
@@ -56,6 +56,7 @@ final class AppModel: ObservableObject {
     @Published var auditStageFilter: String = "all"
     @Published var auditSearchQuery: String = ""
     @Published var pendingApprovals: [ApprovalRecord] = []
+    @Published var activeRuns: [LiveRunSnapshot] = []
     @Published var recentRuns: [RunRecord] = []
     @Published var rules: [ChimeRule] = []
     @Published var auditEvents: [EventAuditRecord] = []
@@ -63,7 +64,9 @@ final class AppModel: ObservableObject {
     @Published var storedSecrets: [String: String] = [:]
     @Published var webhookToken: String = ""
     @Published var webhookStatus: WebhookStatusInfo = WebhookStatusInfo(enabled: true, running: false, host: "127.0.0.1", port: 17380, errorMessage: nil)
+    @Published var tailscaleStatus: TailscaleStatusInfo = TailscaleStatusInfo(installed: false)
     @Published var preferredTerminal: String = "auto"
+    @Published var notchHUDEnabled: Bool = true
     @Published var todayRunsCount: Int = 0
     @Published var todayCostUSD: Double = 0.0
     @Published var paused = false
@@ -76,6 +79,7 @@ final class AppModel: ObservableObject {
 
     let orchestrator: Orchestrator
     let notificationManager: NotificationManager
+    let notchHUD = NotchHUDController()
     private var consoleWindow: NSWindow?
     private var wakeObservers: [Any] = []
     private var promptedFDACurrentSession = false
@@ -102,6 +106,11 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     capturedSelf?.notificationManager.postNotification(for: approval)
                 }
+            },
+            onLiveStreamUpdated: {
+                Task { @MainActor in
+                    capturedSelf?.refreshLiveStreamOnly()
+                }
             }
         )
 
@@ -118,6 +127,7 @@ final class AppModel: ObservableObject {
         notificationManager.setupIfSupported()
         registerWakeObservers()
         refresh()
+        notchHUD.attach(to: self)
     }
 
     func openConsoleWindow(section: ConsoleSection? = nil, ruleID: String? = nil) {
@@ -138,7 +148,7 @@ final class AppModel: ObservableObject {
         let contentView = ConsoleWindowView(model: self)
         let hosting = NSHostingController(rootView: contentView)
         let window = NSWindow(contentViewController: hosting)
-        window.title = "编钟 Bianzhong · 控制台与设置"
+        window.title = "编钟 · 控制台"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.setContentSize(NSSize(width: 920, height: 620))
         window.center()
@@ -158,7 +168,7 @@ final class AppModel: ObservableObject {
         case .handled(let action):
             refresh()
             if case .openConsole(let tabRaw, let ruleID) = action {
-                let sec = tabRaw.flatMap { ConsoleSection(rawValue: $0.lowercased()) } ?? .general
+                let sec = tabRaw.flatMap { ConsoleSection.resolve($0) } ?? .general
                 openConsoleWindow(section: sec, ruleID: ruleID)
             }
         case .requiresConfirmation(let action):
@@ -217,20 +227,28 @@ final class AppModel: ObservableObject {
         wakeObservers = [wsObs, unlockObs]
     }
 
+    func refreshLiveStreamOnly() {
+        activeRuns = orchestrator.activeRuns()
+        notchHUD.syncPresentation()
+    }
+
     func refresh() {
         let previousFeishuStatus = feishuStatus
         let cfg = orchestrator.currentConfig()
         pendingApprovals = orchestrator.pendingApprovals()
+        activeRuns = orchestrator.activeRuns()
         recentRuns = orchestrator.recentRuns()
         rules = orchestrator.allRules()
         paused = orchestrator.isPaused()
         deferredCount = orchestrator.deferredDigestCount()
         feishuEnabled = cfg.feishuSensorEnabled
         preferredTerminal = cfg.terminal
+        notchHUDEnabled = cfg.notchHUDEnabled
         feishuStatus = orchestrator.feishuSensorStatus()
         feishuErrorMessage = orchestrator.feishuSensorErrorMessage()
         webhookStatus = orchestrator.webhookStatus()
         cliStatus = CLIIntegration.currentStatus()
+        notchHUD.syncPresentation()
 
         if consoleWindow?.isVisible == true {
             refreshConsoleData()
@@ -254,12 +272,30 @@ final class AppModel: ObservableObject {
         webhookToken = SecretStore.ensureWebhookToken(paths: orchestrator.paths)
         storedSecrets = SecretStore.loadAll(paths: orchestrator.paths)
         worktrees = orchestrator.listManagedWorktrees()
+        activeRuns = orchestrator.activeRuns()
         recentRuns = orchestrator.recentRuns()
         if let usage = try? orchestrator.store.todayUsageSummary() {
             todayRunsCount = usage.runsCount
             todayCostUSD = usage.totalCostUSD
         }
         loadAuditEvents(stageFilter: auditStageFilter, query: auditSearchQuery)
+        let orch = orchestrator
+        Task {
+            let ts = await Task.detached { orch.tailscaleStatus() }.value
+            self.tailscaleStatus = ts
+        }
+    }
+
+    func setNotchHUD(enabled: Bool) {
+        orchestrator.setNotchHUDEnabled(enabled)
+        refresh()
+    }
+
+    func setTailscaleServe(enabled: Bool) async -> String {
+        let orch = orchestrator
+        let res = await Task.detached { orch.setTailscaleServe(enabled: enabled) }.value
+        self.tailscaleStatus = res.status
+        return res.message
     }
 
     func loadAuditEvents(stageFilter: String?, query: String?) {
@@ -505,7 +541,7 @@ struct MenuBarRootView: View {
             }
 
             Picker("", selection: $model.selectedTab) {
-                Text(model.pendingApprovals.isEmpty ? "听音台" : "听音台 (\(model.pendingApprovals.count))")
+                Text(model.pendingApprovals.isEmpty ? "待办" : "待办 (\(model.pendingApprovals.count))")
                     .tag(MenuBarTab.inbox)
                 Text("规则 (\(model.enabledRulesCount)/\(model.rules.count))")
                     .tag(MenuBarTab.rules)
@@ -559,27 +595,34 @@ struct MenuBarRootView: View {
             .controlSize(.small)
 
             Menu {
-                Button("打开统一控制台与设置...") {
-                    model.openConsoleWindow(section: .general)
+                if !model.activeRuns.isEmpty {
+                    Button("停止全部运行 (\(model.activeRuns.count))") {
+                        _ = model.orchestrator.stopAllActiveRuns()
+                        model.refresh()
+                    }
+                    Divider()
                 }
-                Button("查看信号漏斗透视...") {
+                Button("事件记录...") {
                     model.openConsoleWindow(section: .events)
                 }
-                Button("管理双向 Webhook 与密钥...") {
+                Button("集成与密钥...") {
                     model.openConsoleWindow(section: .webhooks)
                 }
+                Button("运行记录...") {
+                    model.openConsoleWindow(section: .runs)
+                }
                 Divider()
-                Button("重载配置与规则") {
+                Button("重载配置") {
                     model.orchestrator.reloadConfig()
                 }
-                Button("打开终端 AI 配置助手") {
+                Button("AI 配置助手") {
                     model.openConfigChat()
                 }
                 Button("误报调优") {
                     model.openTuneChat()
                 }
                 Divider()
-                Button("退出 Bianzhong") {
+                Button("退出") {
                     model.orchestrator.stop()
                     NSApp.terminate(nil)
                 }
@@ -708,20 +751,45 @@ struct InboxTabView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             }
 
-            if model.pendingApprovals.isEmpty {
+            if !model.activeRuns.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(model.activeRuns) { run in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(run.status == "warm_hold" ? Color.orange : Color.cyan)
+                                .frame(width: 7, height: 7)
+                            Text(run.driver)
+                                .font(.caption.monospaced().bold())
+                            Text(run.currentActivity)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                            Button("中止") {
+                                _ = model.orchestrator.stopRun(id: run.runID)
+                                model.refresh()
+                            }
+                            .controlSize(.mini)
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(Color.cyan.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                    }
+                }
+            }
+
+            if model.pendingApprovals.isEmpty && model.activeRuns.isEmpty {
                 VStack(spacing: 6) {
-                    Image(systemName: "bell.and.waves.left.and.right")
+                    Image(systemName: "tray")
                         .font(.title3)
                         .foregroundStyle(.tertiary)
-                    Text("听音台暂无待办")
+                    Text("暂无待办")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    Text("命中规则的信号经 L0/L1 过滤后会出现在这里")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
                 }
-                .frame(maxWidth: .infinity, minHeight: 130)
-            } else {
+                .frame(maxWidth: .infinity, minHeight: 120)
+            } else if !model.pendingApprovals.isEmpty {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
                         ForEach(model.pendingApprovals) { item in
@@ -742,11 +810,8 @@ struct RulesTabView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("已启用 \(model.enabledRulesCount) / 共 \(model.rules.count) 条")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Spacer()
-                Button("规则工作台 ↗") {
+                Button("管理规则 ↗") {
                     model.openConsoleWindow(section: .rules)
                 }
                 .controlSize(.small)
@@ -756,15 +821,15 @@ struct RulesTabView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .controlSize(.small)
-                .help("重新加载 ~/.config/bianzhong/chimes/*.md")
+                .help("重载规则")
             }
 
             if model.rules.isEmpty {
                 VStack(spacing: 6) {
-                    Text("尚未加载任何规则")
+                    Text("暂无规则")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    Button("打开规则工作台创建") {
+                    Button("新建规则") {
                         model.openConsoleWindow(section: .rules)
                     }
                     .controlSize(.small)
@@ -928,15 +993,10 @@ struct SettingsTabView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("默认终端")
-                            .font(.subheadline.bold())
-                        Text("接管会话与打开规则目录时使用")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text("默认终端")
+                        .font(.subheadline)
                     Spacer()
                     Picker("", selection: Binding(
                         get: { model.preferredTerminal },
@@ -954,26 +1014,26 @@ struct SettingsTabView: View {
                             }
                         }
                     }
+                    .labelsHidden()
                     .frame(width: 165)
                 }
 
                 Divider()
 
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("飞书通知监听")
-                            .font(.subheadline.bold())
-                        Text(feishuSubtitle)
-                            .font(.caption2)
-                            .foregroundStyle(model.feishuStatus == .needsFullDiskAccess ? .orange : .secondary)
-                    }
-                    Spacer()
+                HStack(spacing: 8) {
+                    Text("飞书通知监听")
+                        .font(.subheadline)
                     if model.feishuEnabled && model.feishuStatus == .needsFullDiskAccess {
                         Button("去授权 ↗") {
                             model.presentFDAGuideAlert(allowSuppression: false)
                         }
                         .controlSize(.mini)
+                    } else if model.feishuEnabled && model.feishuStatus == .unavailable {
+                        Text("不可用")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
                     }
+                    Spacer()
                     Toggle("", isOn: Binding(
                         get: { model.feishuEnabled },
                         set: { model.setFeishuSensor(enabled: $0) }
@@ -985,16 +1045,14 @@ struct SettingsTabView: View {
 
                 Divider()
 
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("入站 HTTP Webhook")
-                            .font(.subheadline.bold())
-                        Text(model.webhookStatus.running ? "运行中 127.0.0.1:\(model.webhookStatus.port)" : "未启用")
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
+                HStack(spacing: 8) {
+                    Text("Webhook 服务")
+                        .font(.subheadline)
                     Spacer()
-                    Button("配置与密钥 ↗") {
+                    Text(model.webhookStatus.running ? "127.0.0.1:\(model.webhookStatus.port)" : "未启用")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                    Button("配置 ↗") {
                         model.openConsoleWindow(section: .webhooks)
                     }
                     .controlSize(.small)
@@ -1003,13 +1061,23 @@ struct SettingsTabView: View {
                 Divider()
 
                 HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Zsh 慢命令钩子")
-                            .font(.subheadline.bold())
-                        Text("自动在 ~/.zshrc 监听耗时 ≥15s 的失败命令")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text("刘海悬浮窗 (⌥Space)")
+                        .font(.subheadline)
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { model.notchHUDEnabled },
+                        set: { model.setNotchHUD(enabled: $0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .labelsHidden()
+                }
+
+                Divider()
+
+                HStack {
+                    Text("Zsh 慢命令钩子")
+                        .font(.subheadline)
                     Spacer()
                     Toggle("", isOn: Binding(
                         get: { model.cliStatus.isZshHookInstalled },
@@ -1025,34 +1093,24 @@ struct SettingsTabView: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
             HStack(spacing: 6) {
-                Button("打开统一控制台与设置 ↗") {
+                Button("更多设置 ↗") {
                     model.openConsoleWindow(section: .general)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
 
-                Button("信号透视") {
+                Button("事件记录") {
                     model.openConsoleWindow(section: .events)
                 }
                 .controlSize(.small)
 
                 Spacer()
 
-                Button("清理过期数据") {
+                Button("清理缓存") {
                     model.runGC()
                 }
                 .controlSize(.small)
             }
-        }
-    }
-
-    private var feishuSubtitle: String {
-        guard model.feishuEnabled else { return "已关闭" }
-        switch model.feishuStatus {
-        case .watching: return "已连接（只读监听通知中心）"
-        case .needsFullDiskAccess: return "缺少完全磁盘访问权限"
-        case .unavailable: return model.feishuErrorMessage ?? "通知数据库暂不可读"
-        case .disabled: return "已关闭"
         }
     }
 }
@@ -1068,6 +1126,15 @@ struct ApprovalCard: View {
                     .font(.subheadline.bold())
                     .lineLimit(1)
                 Spacer()
+                if model.orchestrator.isWarmHeldApproval(item.id) {
+                    Text("热挂起")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.15))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
                 Text(item.riskLevel.uppercased())
                     .font(.caption2.bold())
                     .padding(.horizontal, 5)
@@ -1084,6 +1151,17 @@ struct ApprovalCard: View {
                 .font(.caption)
                 .lineLimit(5)
                 .textSelection(.enabled)
+
+            if let diff = item.diffPreview, !diff.isEmpty {
+                Text(diff)
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+                    .background(Color.secondary.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+            }
 
             HStack(spacing: 6) {
                 if item.kind == "question" {
@@ -1106,11 +1184,22 @@ struct ApprovalCard: View {
                     .controlSize(.small)
                 }
 
-                if item.externalSessionID != nil {
-                    Button("终端接管 ↗") {
-                        _ = model.orchestrator.launchTakeover(for: item.id)
+                if item.externalSessionID != nil || item.targetRepo != nil {
+                    Menu("接管 ↗") {
+                        Button("默认终端") {
+                            if !model.orchestrator.launchTakeover(for: item.id),
+                               let repo = item.targetRepo {
+                                _ = TerminalLauncher.openInteractiveShell(at: repo, preferredTerminal: model.preferredTerminal)
+                            }
+                        }
+                        ForEach(TerminalLauncher.installedIDEs) { ide in
+                            Button("在 \(ide.displayName) 打开") {
+                                _ = model.orchestrator.launchIDEHandoff(for: item.id, ide: ide)
+                            }
+                        }
                     }
                     .controlSize(.small)
+                    .frame(width: 78)
                 }
 
                 Spacer()

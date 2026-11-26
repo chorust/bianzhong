@@ -107,6 +107,56 @@ public enum TerminalLauncher {
         return launchCommand(cmd, preferredTerminal: preferredTerminal)
     }
 
+    public enum IDEApp: String, CaseIterable, Codable, Sendable, Identifiable {
+        case t3code
+        case cursor
+        case zed
+        case vscode
+
+        public var id: String { rawValue }
+
+        public var displayName: String {
+            switch self {
+            case .t3code: return "T3 Code"
+            case .cursor: return "Cursor"
+            case .zed: return "Zed"
+            case .vscode: return "VS Code"
+            }
+        }
+
+        public var appURL: URL? {
+            let fm = FileManager.default
+            switch self {
+            case .t3code:
+                for p in ["/Applications/T3 Code (Beta).app", "/Applications/T3 Code.app"] where fm.fileExists(atPath: p) {
+                    return URL(fileURLWithPath: p)
+                }
+                return nil
+            case .cursor:
+                if let u = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.todesktop.230313mzl4w4u92") { return u }
+                return fm.fileExists(atPath: "/Applications/Cursor.app") ? URL(fileURLWithPath: "/Applications/Cursor.app") : nil
+            case .zed:
+                if let u = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "dev.zed.Zed") { return u }
+                return fm.fileExists(atPath: "/Applications/Zed.app") ? URL(fileURLWithPath: "/Applications/Zed.app") : nil
+            case .vscode:
+                return NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.microsoft.VSCode")
+            }
+        }
+
+        public var isInstalled: Bool { appURL != nil }
+    }
+
+    public static var installedIDEs: [IDEApp] {
+        IDEApp.allCases.filter(\.isInstalled)
+    }
+
+    @discardableResult
+    public static func openInIDE(_ ide: IDEApp, directory: String) -> Bool {
+        guard let appURL = ide.appURL else { return false }
+        let expanded = NSString(string: directory).expandingTildeInPath
+        return runOpenProcess(arguments: ["-a", appURL.path, expanded])
+    }
+
     private static func runOpenProcess(arguments: [String]) -> Bool {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")

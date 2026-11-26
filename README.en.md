@@ -12,29 +12,26 @@
 
 *Every signal, a call to action.*
 
-Bianzhong connects local event sources to CLI agents you already use, such as `omp` and `codex`. Event filtering, SQLite state persistence, and subprocess orchestration stay local by default with no relay service, no custom agent harness, and no patches to upstream agent codebases.
+Bianzhong connects local event sources to CLI & ACP agents you already use (`omp-acp`, `opencode-acp`, `claude`, `opencode`, `omp`, `codex`). Event filtering, SQLite state persistence, and subprocess orchestration stay local by default with no public relay service and no patches to upstream agent codebases.
 
-The project ships as a single application bundle: `Bianzhong.app` embeds the menu bar inbox, daemon, in-process Feishu notification monitor, and the `bz` CLI. Opening `Bianzhong.app` initializes default templates and automatically symlinks `bz` into your `PATH`. **Clipboard watching, FSEvents workspace monitoring, built-in cron schedules, and LaunchAgent auto-start are not yet implemented** and belong to later milestones; the current release focuses on read-only Notification Center capture for Feishu, failed slow-command hooks in Zsh, and script ingestion via `bz emit`.
+The project ships as a single application bundle: `Bianzhong.app` embeds the menu bar inbox, the non-activating Notch HUD ("Chime Beam", `⌥Space`), the unified Console (`⌘,`), the Tailscale Mobile Pocket Console PWA (`/pocket`), the in-process Feishu notification monitor, and the `bz` CLI.
 
 <p align="center">
   <a href="docs/00-mvp-architecture-and-roadmap.md">Architecture & roadmap</a> · <a href="docs/research/01-macos-perception-and-hammerspoon2.md">macOS perception notes</a><br>
   <a href="docs/research/03-agent-dispatch-and-lifecycle.md">Agent dispatch & lifecycle</a> · <a href="docs/research/04-trigger-funnel-permissions-and-hitl.md">Funnel & approval model</a>
 </p>
 
-The latest published release is **v0.3.0** (macOS 26 Apple Silicon single-app preview). The install examples below reference the **v0.3.0** release artifacts on GitHub.
+The latest published release is **v0.5.0** (macOS 26 Apple Silicon single-app bundle). The install examples below reference the **v0.5.0** release artifacts on GitHub.
 
 [Features](#features) · [Screenshots](#screenshots) · [Install](#install) · [Usage](#usage) · [Project and licensing](#project-and-licensing) · [Dev](#dev)
 
 ## Features
 
-- Single-app setup: `Bianzhong.app` bundles both the `bz` CLI and Feishu Notification Center watcher, symlinking `bz` into `~/.local/bin/bz` (and `/opt/homebrew/bin/bz` when writable) on launch, with dedicated Rules and Settings tabs in the menu bar for rule toggles, live dry-run testing, and `~/.zshrc` hooks.
-- Multi-source local perception: reads `com.electron.lark` notification records read-only from `usernoted` (with guided Full Disk Access onboarding), receives failed slow commands via `bz shell-hook zsh`, and ingests custom scripts or webhooks through `bz emit` and `ingest.sock`.
-- Deterministic L0 funnel & watchdogs: drops `restricted` privacy events before any database write, blocks feedback loops across four layers, and supports per-field AND matching (`title` / `subtitle` / `body` / `cwd`), cumulative window hit thresholds (`min_count` + `window: daily`), missed-signal watchdogs (`expect`), TTL dedup, trailing debounce coalescing, and cooldown locks without touching an LLM.
-- Pluggable L1 triage: supports on-device macOS 26 `FoundationModels` (`apple_fm`), a lightweight model via `omp` or `codex` (`agent_cli`), an external HTTP `decision_api` gateway, or rule pass-through (`none`).
-- Two-phase agent execution: spawns `omp` or `codex` on demand in an isolated process group (`posix_spawn`) with zero idle daemon footprint; Phase 1 runs read-only investigation and drafting, while Phase 2 enters `workspace-write` or an isolated Git worktree only after human approval.
-- Menu bar inbox and interactive notifications: `Bianzhong.app` and `UNUserNotificationCenter` actions support background approval, approval comments, copying a reply and activating Feishu, or resuming the exact session in Ghostty, iTerm2, Warp, or Terminal (`omp -r` / `codex resume`); signals arriving during Focus or screen lock can defer into a single wake digest.
-- Post-actions and runtime governance: conditional `on_complete` pipelines (`notify`, `webhook`, `shortcut`, `append_markdown`, `shell`, `clipboard`, `chime_sound`) alongside daily cost/run caps, circuit breakers on consecutive failures, and retention GC that preserves dirty Git worktrees.
-- Offline simulation and tuning: dry-run single signals with `bz simulate`, replay recorded history with `bz replay`, and inspect rejected samples with `bz tune` to tighten noisy chimes.
+- Single-app setup: `Bianzhong.app` bundles the `bz` CLI, unified Console (`⌘,`), Launch-at-Login toggle, and terminal selector (Ghostty, iTerm2, Warp, Kitty, WezTerm, Alacritty, cmux, Terminal).
+- ACP bidirectional streaming & warm-hold: native Agent Client Protocol (`stdio` JSON-RPC 2.0) runner supporting `omp-acp`, `opencode-acp`, `claude-acp`, and `gemini-acp` with live `session/update` telemetry, `<5ms` in-place **warm-hold** resume on `session/request_permission`, inline mid-flight steering (`Steer`), and 1-click task cancellation—alongside `claude`, `opencode`, `omp`, and `codex` CLI drivers.
+- Non-activating Notch HUD ("Chime Beam"): zero-TCC Carbon hotkey (`⌥Space`), `sharingType = .none` screen-share invisibility, hardware notch safe-area alignment, syntax-colored diff preview, drag-and-drop file diagnosis, and 1-click worktree handoff to **T3 Code, Cursor, Zed, VS Code**, or your preferred terminal.
+- Tailscale Mobile Pocket Console PWA: built-in standalone mobile console (`/pocket`) paired via QR code over private `tailscale serve` HTTPS—review diffs, approve/steer/dismiss items, or stop all active runs from your phone with zero public IP exposure.
+- Bidirectional webhooks & L0/L1 funnel: inbound `/v1/emit`, `/v1/hooks/{github|feishu|sentry|grafana}`, `bianzhong://` deep links, signed outbound cards (Feishu Bot, Slack, Bark, Discord, Telegram), four-layer loop prevention, window watchdogs (`expect`), on-device `FoundationModels` triage (`apple_fm`), and isolated Git worktrees.
 
 ## Screenshots
 
@@ -65,11 +62,11 @@ Download the latest `.dmg` from [Releases](https://github.com/chorust/bianzhong/
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/Bianzhong-0.3.0-macos26-arm64.tar.gz
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.5.0/Bianzhong-0.5.0-macos26-arm64.tar.gz
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.5.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-tar -xzf Bianzhong-0.3.0-macos26-arm64.tar.gz
-cp -R "Bianzhong-0.3.0/Bianzhong.app" /Applications/
+tar -xzf Bianzhong-0.5.0-macos26-arm64.tar.gz
+cp -R "Bianzhong-0.5.0/Bianzhong.app" /Applications/
 open /Applications/Bianzhong.app
 ```
 
@@ -82,10 +79,10 @@ You can also install `Bianzhong.app` into `/Applications/` and `/usr/local/bin/b
 ```bash
 workdir="$(mktemp -d)"
 cd "$workdir"
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/Bianzhong-0.3.0-macos26-arm64.pkg
-curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.3.0/SHA256SUMS.txt
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.5.0/Bianzhong-0.5.0-macos26-arm64.pkg
+curl -fL -O https://github.com/chorust/bianzhong/releases/download/v0.5.0/SHA256SUMS.txt
 shasum -a 256 --ignore-missing -c SHA256SUMS.txt
-sudo installer -pkg Bianzhong-0.3.0-macos26-arm64.pkg -target /
+sudo installer -pkg Bianzhong-0.5.0-macos26-arm64.pkg -target /
 ```
 
 Prebuilt bundles are ad-hoc signed without Apple notarization. After verifying checksums, clear quarantine attributes if Gatekeeper prompts on first launch:

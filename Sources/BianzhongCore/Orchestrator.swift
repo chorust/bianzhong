@@ -55,13 +55,16 @@ public enum IncomingURLOutcome: Equatable, Sendable {
 public struct OrchestratorCallbacks: Sendable {
     public var onApprovalUpdated: @Sendable () -> Void
     public var onNotifyApproval: @Sendable (ApprovalRecord) -> Void
+    public var onLiveStreamUpdated: @Sendable () -> Void
 
     public init(
         onApprovalUpdated: @escaping @Sendable () -> Void = {},
-        onNotifyApproval: @escaping @Sendable (ApprovalRecord) -> Void = { _ in }
+        onNotifyApproval: @escaping @Sendable (ApprovalRecord) -> Void = { _ in },
+        onLiveStreamUpdated: @escaping @Sendable () -> Void = {}
     ) {
         self.onApprovalUpdated = onApprovalUpdated
         self.onNotifyApproval = onNotifyApproval
+        self.onLiveStreamUpdated = onLiveStreamUpdated
     }
 }
 
@@ -143,6 +146,10 @@ public final class Orchestrator: @unchecked Sendable {
     private var pauseTimer: DispatchSourceTimer?
     private var expectTimer: DispatchSourceTimer?
     private let runGate: ConcurrencyGate
+    private var liveRuns: [String: LiveRunSnapshot] = [:]
+    private var activeProcessHandles: [String: ActiveProcessHandle] = [:]
+    private var activeAcpHandles: [String: AcpLiveSessionHandle] = [:]
+    private var warmHoldApprovalToRunID: [String: String] = [:]
 
     public init(paths: BianzhongPaths = BianzhongPaths(), callbacks: OrchestratorCallbacks = OrchestratorCallbacks()) throws {
         self.paths = paths
@@ -297,6 +304,14 @@ public final class Orchestrator: @unchecked Sendable {
                 } else {
                     return self.reject(id: id, comment: comment ?? "Rejected via HTTP webhook")
                 }
+            },
+            onPocketState: { [weak self] in
+                guard let self else { return Data("{}".utf8) }
+                return self.buildPocketStateJSON()
+            },
+            onPocketAction: { [weak self] body in
+                guard let self else { return (false, "Orchestrator stopped") }
+                return self.handlePocketAction(body)
             }
         )
 
@@ -484,6 +499,185 @@ public final class Orchestrator: @unchecked Sendable {
     public func setPreferredTerminal(_ terminal: String) {
         try? AppConfig.setTerminal(terminal, in: paths.configFile)
         reloadConfig()
+    }
+
+    public func setNotchHUDEnabled(_ enabled: Bool) {
+        try? AppConfig.setNotchHUDEnabled(enabled, in: paths.configFile)
+        reloadConfig()
+    }
+
+    public func tailscaleStatus() -> TailscaleStatusInfo {
+        let port = webhookStatus().port > 0 ? webhookStatus().port : UInt16(clamping: currentConfig().webhookPort)
+        return TailscaleBridge.queryStatus(localPort: port)
+    }
+
+    public func setTailscaleServe(enabled: Bool) -> (ok: Bool, status: TailscaleStatusInfo, message: String) {
+        if enabled && !currentConfig().webhookServerEnabled {
+            var cfg = currentConfig()
+            cfg.webhookServerEnabled = true
+            try? saveConfig(cfg)
+        }
+        let port = webhookStatus().port > 0 ? webhookStatus().port : UInt16(clamping: currentConfig().webhookPort)
+        let res = TailscaleBridge.setServe(enabled: enabled, localPort: port)
+        if res.ok, enabled, let httpsBase = res.status.httpsBaseURL {
+            var cfg = currentConfig()
+            if (cfg.webhookCallbackBaseURL ?? "").isEmpty {
+                cfg.webhookCallbackBaseURL = httpsBase
+                try? saveConfig(cfg)
+            }
+        }
+        callbacks.onApprovalUpdated()
+        return res
+    }
+
+    public func activeRuns() -> [LiveRunSnapshot] {
+        stateLock.withLock {
+            Array(liveRuns.values).sorted { $0.startedAtMs > $1.startedAtMs }
+        }
+    }
+
+    public func isWarmHeldApproval(_ approvalID: String) -> Bool {
+        stateLock.withLock {
+            guard let rid = warmHoldApprovalToRunID[approvalID],
+                  let acp = activeAcpHandles[rid] else {
+                return false
+            }
+            return acp.isWaitingPermission
+        }
+    }
+
+    @discardableResult
+    public func stopRun(id runID: String) -> Bool {
+        let (procHandle, acpHandle): (ActiveProcessHandle?, AcpLiveSessionHandle?) = stateLock.withLock {
+            if var snap = liveRuns[runID] {
+                snap.status = "stopping"
+                snap.currentActivity = "正在中止..."
+                liveRuns[runID] = snap
+            }
+            return (activeProcessHandles[runID], activeAcpHandles[runID])
+        }
+        guard procHandle != nil || acpHandle != nil else { return false }
+        procHandle?.cancel()
+        acpHandle?.cancel()
+        callbacks.onApprovalUpdated()
+        return true
+    }
+
+    @discardableResult
+    public func stopAllActiveRuns() -> Int {
+        let ids = stateLock.withLock { Array(liveRuns.keys) }
+        var stopped = 0
+        for id in ids where stopRun(id: id) {
+            stopped += 1
+        }
+        return stopped
+    }
+
+    private func upsertLiveRun(_ snapshot: LiveRunSnapshot) {
+        stateLock.withLock {
+            liveRuns[snapshot.runID] = snapshot
+        }
+        callbacks.onApprovalUpdated()
+    }
+
+    private func mutateLiveRun(id runID: String, notify: Bool = true, _ body: (inout LiveRunSnapshot) -> Void) {
+        var didMutate = false
+        stateLock.withLock {
+            if var snap = liveRuns[runID] {
+                body(&snap)
+                liveRuns[runID] = snap
+                didMutate = true
+            }
+        }
+        if didMutate && notify {
+            callbacks.onLiveStreamUpdated()
+        }
+    }
+
+    private func removeLiveRun(id runID: String) {
+        stateLock.withLock {
+            liveRuns.removeValue(forKey: runID)
+            activeProcessHandles.removeValue(forKey: runID)
+            activeAcpHandles.removeValue(forKey: runID)
+            warmHoldApprovalToRunID = warmHoldApprovalToRunID.filter { $0.value != runID }
+        }
+        callbacks.onApprovalUpdated()
+    }
+
+    private func buildPocketStateJSON() -> Data {
+        struct PocketEnvelope: Encodable {
+            let paused: Bool
+            let today_runs_count: Int
+            let today_cost_usd: Double
+            let active_runs: [LiveRunSnapshot]
+            let approvals: [ApprovalRecord]
+            let recent_runs: [RunRecord]
+        }
+        let usage = (try? store.todayUsageSummary()) ?? (runsCount: 0, totalCostUSD: 0.0)
+        let env = PocketEnvelope(
+            paused: isPaused(),
+            today_runs_count: usage.runsCount,
+            today_cost_usd: usage.totalCostUSD,
+            active_runs: activeRuns(),
+            approvals: pendingApprovals(),
+            recent_runs: recentRuns()
+        )
+        return (try? JSONEncoder().encode(env)) ?? Data("{}".utf8)
+    }
+
+    private func handlePocketAction(_ body: [String: Any]) -> (ok: Bool, message: String) {
+        let action = ((body["action"] as? String) ?? "").lowercased()
+        let approvalID = (body["approval_id"] as? String) ?? ""
+        let comment = ((body["comment"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let nonEmptyComment = comment.isEmpty ? nil : comment
+
+        switch action {
+        case "approve":
+            guard !approvalID.isEmpty else { return (false, "缺少 approval_id") }
+            let ok = approve(id: approvalID, comment: nonEmptyComment ?? "Approved via Tailscale Pocket")
+            return (ok, ok ? "已批准执行" : "该待办已处理或不存在")
+        case "steer":
+            guard !approvalID.isEmpty else { return (false, "缺少 approval_id") }
+            guard let instruction = nonEmptyComment else { return (false, "请先输入调整指令") }
+            let ok = steer(id: approvalID, instruction: instruction)
+            return (ok, ok ? "已发送调整指令" : "无法调整该待办")
+        case "reject":
+            guard !approvalID.isEmpty else { return (false, "缺少 approval_id") }
+            let ok = reject(id: approvalID, comment: nonEmptyComment ?? "Dismissed via Tailscale Pocket")
+            return (ok, ok ? "已忽略" : "该待办已处理或不存在")
+        case "stop_run":
+            let runID = (body["run_id"] as? String) ?? ""
+            let ok = stopRun(id: runID)
+            return (ok, ok ? "已发送中止信号" : "运行已结束")
+        case "stop_all":
+            let count = stopAllActiveRuns()
+            return (true, "已中止 \(count) 个活跃任务")
+        case "pause":
+            let secs = (body["seconds"] as? Double)
+                ?? (body["seconds"] as? Int).map(Double.init)
+                ?? 3600.0
+            let bounded = max(0.2, secs)
+            pause(forSeconds: bounded)
+            return (true, "已暂停 \(Int(ceil(bounded))) 秒")
+        case "resume":
+            resume()
+            return (true, "已恢复运行")
+        case "emit":
+            let title = (body["title"] as? String) ?? "手机远程触发"
+            let msg = (body["body"] as? String) ?? ""
+            let ev = EventEnvelope(
+                source: "bz://pocket/pwa",
+                type: "dev.bianzhong.pocket.emit",
+                correlationKey: "pocket:\(title)",
+                privacyLevel: .internal,
+                payload: ["title": title, "body": msg],
+                ambientContext: .captureCurrent()
+            )
+            let resp = handleBusRequest(BusRequest(action: "emit", event: ev))
+            return (resp.ok, "已派发（\(resp.disposition ?? resp.message)）")
+        default:
+            return (false, "未知操作：\(action)")
+        }
     }
 
     @discardableResult
@@ -1189,8 +1383,70 @@ public final class Orchestrator: @unchecked Sendable {
             status: "running"
         )
 
+        let displayTitle = event.payload["title"] ?? rule.id
+        upsertLiveRun(
+            LiveRunSnapshot(
+                runID: runID,
+                chimeID: rule.id,
+                driver: driver.id,
+                phase: "draft",
+                title: displayTitle,
+                workingDirectory: workingDir,
+                startedAtMs: SQLiteStore.nowMs(),
+                status: "running",
+                currentActivity: "启动 \(driver.id)..."
+            )
+        )
+        defer { removeLiveRun(id: runID) }
+
+        if let acpDriver = driver as? AcpAgentDriver {
+            await performAcpPhase1(
+                acpDriver: acpDriver,
+                request: request,
+                event: event,
+                rule: rule,
+                workingDir: workingDir,
+                runID: runID,
+                existingSession: existingSession
+            )
+            return
+        }
+
+        let procHandle = ActiveProcessHandle()
+        stateLock.withLock { activeProcessHandles[runID] = procHandle }
+        let throttle = StreamThrottleBox()
         let spec = driver.buildSpawnSpec(request: request)
-        let procResult = await AgentProcessRunner.run(spec: spec, timeoutSeconds: rule.phase1MaxTimeSeconds)
+        let procResult = await AgentProcessRunner.run(
+            spec: spec,
+            timeoutSeconds: rule.phase1MaxTimeSeconds,
+            handle: procHandle
+        ) { [weak self] line in
+            guard let self else { return }
+            let evs = driver.parseStdoutLine(line)
+            var latestActivity: String?
+            var deltaChunk = ""
+            for ev in evs {
+                switch ev {
+                case .toolActivity(let name, _):
+                    latestActivity = "⚡ \(name)"
+                case .textDelta(let chunk):
+                    deltaChunk += chunk
+                case .finalAnswer(let text):
+                    deltaChunk = text
+                default:
+                    break
+                }
+            }
+            if latestActivity != nil || !deltaChunk.isEmpty {
+                let shouldNotify = latestActivity != nil || throttle.shouldEmit()
+                self.mutateLiveRun(id: runID, notify: shouldNotify) { snap in
+                    if let act = latestActivity { snap.currentActivity = act }
+                    if !deltaChunk.isEmpty {
+                        snap.streamPreview = String((snap.streamPreview + deltaChunk).suffix(800))
+                    }
+                }
+            }
+        }
 
         let parsed = parseAgentStdout(procResult.stdout, driver: driver, initialSessionID: existingSession?.externalSessionID)
         let capturedExtSession = parsed.externalSessionID
@@ -1198,7 +1454,7 @@ public final class Orchestrator: @unchecked Sendable {
         let outTok = parsed.outputTokens
         let cacheTok = parsed.cachedTokens
         let totalCost = parsed.costUSD
-        let fallbackMsg = procResult.stderr.isEmpty ? "Completed with exit code \(procResult.exitCode)" : procResult.stderr
+        let fallbackMsg = procHandle.isCancelled ? "已手动中止" : (procResult.stderr.isEmpty ? "Completed with exit code \(procResult.exitCode)" : procResult.stderr)
         let summary = parsed.finalText ?? (parsed.errorMessages.isEmpty ? fallbackMsg : parsed.errorMessages.joined(separator: "\n"))
         var internalSessionID = existingSession?.id
         if let extID = capturedExtSession, !extID.isEmpty {
@@ -1215,7 +1471,19 @@ public final class Orchestrator: @unchecked Sendable {
             )
         }
 
-        let runStatus = procResult.timedOut ? "timeout" : (procResult.exitCode == 0 ? "waiting_approval" : (procResult.exitCode == 3 ? "budget_exceeded" : "failed"))
+        let runStatus: String
+        if procHandle.isCancelled {
+            runStatus = "cancelled"
+        } else if procResult.timedOut {
+            runStatus = "timeout"
+        } else if procResult.exitCode == 0 {
+            runStatus = "waiting_approval"
+        } else if procResult.exitCode == 3 {
+            runStatus = "budget_exceeded"
+        } else {
+            runStatus = "failed"
+        }
+
         try? store.updateRunStatus(
             id: runID,
             sessionID: internalSessionID,
@@ -1229,6 +1497,9 @@ public final class Orchestrator: @unchecked Sendable {
             errorMessage: procResult.exitCode == 0 ? nil : String(procResult.stderr.prefix(1000))
         )
 
+        guard !procHandle.isCancelled else { return }
+
+        let diffText = captureGitDiffPreview(in: workingDir)
         let kind = event.type.contains("feishu") ? "question" : "review"
         let approval = ApprovalRecord(
             id: "apr-\(UUID().uuidString.prefix(8))",
@@ -1238,7 +1509,7 @@ public final class Orchestrator: @unchecked Sendable {
             chimeID: rule.id,
             kind: kind,
             riskLevel: rule.worktreeOnPhase2 ? "medium" : "high",
-            title: event.payload["title"] ?? rule.id,
+            title: displayTitle,
             provenanceSummary: "\(event.source) • \(rule.id) • \(rule.driver)",
             proposedAction: String(summary.prefix(3500)),
             targetRepo: workingDir,
@@ -1246,7 +1517,8 @@ public final class Orchestrator: @unchecked Sendable {
             status: "pending",
             userComment: nil,
             createdAt: SQLiteStore.nowMs(),
-            resolvedAt: nil
+            resolvedAt: nil,
+            diffPreview: diffText
         )
         try? store.insertApproval(approval)
         callbacks.onApprovalUpdated()
@@ -1264,6 +1536,298 @@ public final class Orchestrator: @unchecked Sendable {
         if rule.autonomy == .boundedAuto && procResult.exitCode == 0 {
             approve(id: approval.id, comment: "Auto-approved by bounded_auto rule")
         }
+    }
+
+    private func performAcpPhase1(
+        acpDriver: AcpAgentDriver,
+        request: AgentInvocationRequest,
+        event: EventEnvelope,
+        rule: ChimeRule,
+        workingDir: String,
+        runID: String,
+        existingSession: (id: String, externalSessionID: String, cwd: String)?
+    ) async {
+        let acpExecDir: String
+        if rule.worktreeOnPhase2 && !Self.isSubpath(URL(fileURLWithPath: workingDir), of: paths.worktreesDir) {
+            acpExecDir = TerminalLauncher.prepareWorktreeIfGitRepo(repoPath: workingDir, runID: runID, worktreesDir: paths.worktreesDir)
+        } else {
+            acpExecDir = workingDir
+        }
+        let acpRequest = AgentInvocationRequest(
+            runID: request.runID,
+            correlationKey: request.correlationKey,
+            workingDirectory: acpExecDir,
+            promptText: request.promptText,
+            eventFilePath: request.eventFilePath,
+            sessionDir: request.sessionDir,
+            permissionProfile: request.permissionProfile,
+            modelOverride: request.modelOverride,
+            resumeSessionID: request.resumeSessionID,
+            worktreeRequested: rule.worktreeOnPhase2,
+            ephemeral: request.ephemeral,
+            maxTimeSeconds: request.maxTimeSeconds,
+            maxCostUSD: request.maxCostUSD
+        )
+        mutateLiveRun(id: runID, notify: false) { snap in
+            snap = LiveRunSnapshot(
+                runID: snap.runID,
+                chimeID: snap.chimeID,
+                driver: snap.driver,
+                phase: snap.phase,
+                title: snap.title,
+                workingDirectory: acpExecDir,
+                startedAtMs: snap.startedAtMs,
+                status: snap.status,
+                currentActivity: snap.currentActivity,
+                streamPreview: snap.streamPreview,
+                diffPreview: snap.diffPreview,
+                pendingApprovalID: snap.pendingApprovalID,
+                pid: snap.pid
+            )
+        }
+
+        let leaseActive = LockedValueBox<Bool>(false)
+        let leaseTTL = TimeInterval(max(rule.phase1MaxTimeSeconds, rule.phase2MaxTimeSeconds) + 15)
+        if rule.autonomy == .boundedAuto {
+            funnel.registerWriteLease(pathPrefix: workingDir, ttlSeconds: leaseTTL)
+            if acpExecDir != workingDir {
+                funnel.registerWriteLease(pathPrefix: acpExecDir, ttlSeconds: leaseTTL)
+            }
+            leaseActive.set(true)
+        }
+        defer {
+            if leaseActive.get() {
+                funnel.releaseWriteLease(pathPrefix: workingDir, graceSeconds: 1.5)
+                if acpExecDir != workingDir {
+                    funnel.releaseWriteLease(pathPrefix: acpExecDir, graceSeconds: 1.5)
+                }
+            }
+        }
+
+        let acpHandle = AcpLiveSessionHandle(runID: runID)
+        stateLock.withLock { activeAcpHandles[runID] = acpDriver.id.isEmpty ? nil : acpHandle }
+        let throttle = StreamThrottleBox()
+        let displayTitle = event.payload["title"] ?? rule.id
+
+        let outcome = await AcpSessionRunner.run(
+            spec: acpDriver.buildAcpSpawnSpec(request: acpRequest),
+            request: acpRequest,
+            handle: acpHandle,
+            warmHoldTimeoutSeconds: max(600, rule.phase2MaxTimeSeconds),
+            onStreamUpdate: { [weak self] activity, fullText, diffSnap in
+                guard let self else { return }
+                let shouldNotify = activity != nil || throttle.shouldEmit()
+                self.mutateLiveRun(id: runID, notify: shouldNotify) { snap in
+                    if let act = activity { snap.currentActivity = act }
+                    if !fullText.isEmpty { snap.streamPreview = String(fullText.suffix(800)) }
+                    if let diffSnap { snap.diffPreview = diffSnap }
+                }
+            },
+            onWarmHoldPermission: { [weak self] permCtx in
+                guard let self else { return .reject }
+                if rule.autonomy == .boundedAuto {
+                    return .allowOnce(comment: "Auto-approved by bounded_auto")
+                }
+                let aprID = "apr-\(UUID().uuidString.prefix(8))"
+                var internalSID = existingSession?.id
+                if !permCtx.sessionID.isEmpty {
+                    let sid = internalSID ?? "ses-\(UUID().uuidString.prefix(8))"
+                    internalSID = sid
+                    try? self.store.upsertSession(
+                        id: sid,
+                        correlationKey: event.correlationKey,
+                        driver: acpDriver.id,
+                        policy: rule.sessionPolicy,
+                        externalSessionID: permCtx.sessionID,
+                        cwd: acpExecDir,
+                        ttlSeconds: rule.sessionTTLSeconds
+                    )
+                }
+                let draftBody = permCtx.draftTextSoFar.isEmpty
+                    ? "ACP 会话请求执行：\(permCtx.toolTitle)"
+                    : "\(permCtx.draftTextSoFar)\n\n[待批操作] \(permCtx.toolTitle)"
+                let apr = ApprovalRecord(
+                    id: aprID,
+                    runID: runID,
+                    eventID: event.id,
+                    sessionID: internalSID,
+                    chimeID: rule.id,
+                    kind: "review",
+                    riskLevel: rule.worktreeOnPhase2 ? "medium" : "high",
+                    title: displayTitle,
+                    provenanceSummary: "\(event.source) • \(acpDriver.id) • 热挂起待批",
+                    proposedAction: String(draftBody.prefix(3500)),
+                    targetRepo: acpExecDir,
+                    externalSessionID: permCtx.sessionID.isEmpty ? nil : permCtx.sessionID,
+                    status: "pending",
+                    userComment: nil,
+                    createdAt: SQLiteStore.nowMs(),
+                    resolvedAt: nil,
+                    diffPreview: permCtx.diffPreview
+                )
+                try? self.store.insertApproval(apr)
+                self.stateLock.withLock {
+                    self.warmHoldApprovalToRunID[aprID] = runID
+                    if var snap = self.liveRuns[runID] {
+                        snap.status = "warm_hold"
+                        snap.pendingApprovalID = aprID
+                        snap.currentActivity = "热挂起等待批准：\(permCtx.toolTitle)"
+                        snap.diffPreview = permCtx.diffPreview ?? snap.diffPreview
+                        self.liveRuns[runID] = snap
+                    }
+                }
+                self.callbacks.onApprovalUpdated()
+                self.callbacks.onNotifyApproval(apr)
+
+                let decision = await acpHandle.waitForPermissionDecision(timeoutSeconds: max(600, rule.phase2MaxTimeSeconds))
+                self.stateLock.withLock {
+                    _ = self.warmHoldApprovalToRunID.removeValue(forKey: aprID)
+                    if var snap = self.liveRuns[runID] {
+                        snap.status = "running"
+                        snap.pendingApprovalID = nil
+                        self.liveRuns[runID] = snap
+                    }
+                }
+                // Clean up ghost pending approval if cancelled via stopRun() or timed out without approve/steer/reject
+                if (try? self.store.getApproval(id: aprID))?.status == "pending" {
+                    let reason = acpHandle.isCancelled ? "Cancelled by stopRun" : "Warm-hold timed out"
+                    _ = try? self.store.resolvePendingApprovalAtomically(id: aprID, status: "expired", comment: reason)
+                    self.callbacks.onApprovalUpdated()
+                }
+                if case .allowOnce = decision, !leaseActive.get() {
+                    self.funnel.registerWriteLease(pathPrefix: workingDir, ttlSeconds: leaseTTL)
+                    if acpExecDir != workingDir {
+                        self.funnel.registerWriteLease(pathPrefix: acpExecDir, ttlSeconds: leaseTTL)
+                    }
+                    leaseActive.set(true)
+                }
+                return decision
+            }
+        )
+
+        var internalSessionID = existingSession?.id
+        if let extID = outcome.externalSessionID, !extID.isEmpty {
+            let sid = internalSessionID ?? "ses-\(UUID().uuidString.prefix(8))"
+            internalSessionID = sid
+            try? store.upsertSession(
+                id: sid,
+                correlationKey: event.correlationKey,
+                driver: acpDriver.id,
+                policy: rule.sessionPolicy,
+                externalSessionID: extID,
+                cwd: acpExecDir,
+                ttlSeconds: rule.sessionTTLSeconds
+            )
+        }
+
+        let summary = outcome.finalText.isEmpty ? (outcome.errorMessage ?? "ACP run finished (\(outcome.stopReason))") : outcome.finalText
+        let runStatus: String
+        if outcome.cancelled {
+            runStatus = "cancelled"
+        } else if outcome.timedOut {
+            runStatus = "timeout"
+        } else if outcome.exitCode == 0 {
+            runStatus = outcome.warmHoldApprovedAndExecuted ? "succeeded" : "waiting_approval"
+        } else {
+            runStatus = "failed"
+        }
+
+        try? store.updateRunStatus(
+            id: runID,
+            sessionID: internalSessionID,
+            status: runStatus,
+            exitCode: outcome.exitCode,
+            inputTokens: outcome.inputTokens,
+            outputTokens: outcome.outputTokens,
+            cachedTokens: outcome.cachedTokens,
+            costUSD: outcome.costUSD,
+            outputSummary: String(summary.prefix(4000)),
+            errorMessage: outcome.errorMessage.map { String($0.prefix(1000)) }
+        )
+
+        if outcome.cancelled {
+            if acpExecDir != workingDir {
+                try? removeWorktree(at: acpExecDir)
+            }
+            return
+        }
+
+        let finalDiff = outcome.diffPreview ?? captureGitDiffPreview(in: acpExecDir)
+
+        // If the ACP session already warm-held, got approved in-place, and completed the edit, post a completion notice!
+        if outcome.warmHoldApprovedAndExecuted {
+            if let sid = internalSessionID, acpExecDir != workingDir {
+                try? store.updateSessionAfterPhase2(id: sid, externalSessionID: outcome.externalSessionID ?? "", cwd: acpExecDir, worktreePath: acpExecDir)
+            }
+            let doneApr = ApprovalRecord(
+                id: "apr-\(UUID().uuidString.prefix(8))",
+                runID: runID,
+                eventID: event.id,
+                sessionID: internalSessionID,
+                chimeID: rule.id,
+                kind: "notify",
+                riskLevel: "low",
+                title: "✓ 已完成：\(displayTitle)",
+                provenanceSummary: "\(acpDriver.id) • 原位热恢复执行完成",
+                proposedAction: String(summary.prefix(3500)),
+                targetRepo: acpExecDir,
+                externalSessionID: outcome.externalSessionID,
+                status: "pending",
+                userComment: nil,
+                createdAt: SQLiteStore.nowMs(),
+                resolvedAt: nil,
+                diffPreview: finalDiff
+            )
+            try? store.insertApproval(doneApr)
+            callbacks.onApprovalUpdated()
+            let ctx = ActionContext(event: event, rule: rule, approval: doneApr, phase: "execute", summaryText: doneApr.proposedAction, sessionID: outcome.externalSessionID)
+            await actionDispatcher.dispatch(specs: rule.onComplete, context: ctx)
+            return
+        }
+
+        let kind = event.type.contains("feishu") ? "question" : "review"
+        let approval = ApprovalRecord(
+            id: "apr-\(UUID().uuidString.prefix(8))",
+            runID: runID,
+            eventID: event.id,
+            sessionID: internalSessionID,
+            chimeID: rule.id,
+            kind: kind,
+            riskLevel: rule.worktreeOnPhase2 ? "medium" : "high",
+            title: displayTitle,
+            provenanceSummary: "\(event.source) • \(rule.id) • \(acpDriver.id)",
+            proposedAction: String(summary.prefix(3500)),
+            targetRepo: acpExecDir,
+            externalSessionID: outcome.externalSessionID,
+            status: "pending",
+            userComment: nil,
+            createdAt: SQLiteStore.nowMs(),
+            resolvedAt: nil,
+            diffPreview: finalDiff
+        )
+        try? store.insertApproval(approval)
+        callbacks.onApprovalUpdated()
+
+        let actionCtx = ActionContext(
+            event: event,
+            rule: rule,
+            approval: approval,
+            phase: "draft",
+            summaryText: approval.proposedAction,
+            sessionID: outcome.externalSessionID
+        )
+        await actionDispatcher.dispatch(specs: rule.onComplete, context: actionCtx)
+
+        if rule.autonomy == .boundedAuto && outcome.exitCode == 0 {
+            approve(id: approval.id, comment: "Auto-approved by bounded_auto rule")
+        }
+    }
+
+    private func captureGitDiffPreview(in directory: String) -> String? {
+        guard FileManager.default.fileExists(atPath: directory) else { return nil }
+        let raw = runGitCapture(in: directory, args: ["diff", "--no-ext-diff", "HEAD"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? nil : String(raw.prefix(6000))
     }
 
     private func executePreflightIfNeeded(rule: ChimeRule, event: EventEnvelope, workingDir: String) async -> String? {
@@ -1293,10 +1857,20 @@ public final class Orchestrator: @unchecked Sendable {
 
     @discardableResult
     public func approve(id: String, comment: String?) -> Bool {
+        let warmAcpHandle: AcpLiveSessionHandle? = stateLock.withLock {
+            guard let rid = warmHoldApprovalToRunID[id] else { return nil }
+            return activeAcpHandles[rid]
+        }
+
         guard let approval = (try? store.resolvePendingApprovalAtomically(id: id, status: "approved", comment: comment)) ?? nil else {
             return false
         }
         callbacks.onApprovalUpdated()
+
+        // Fast path: resume warm-held ACP subprocess in-place (<5ms)!
+        if let warmAcpHandle, warmAcpHandle.resolvePermission(.allowOnce(comment: comment)) {
+            return true
+        }
 
         guard approval.kind != "notify",
               approval.kind != "digest",
@@ -1315,6 +1889,67 @@ public final class Orchestrator: @unchecked Sendable {
         return true
     }
 
+    /// Steers a warm-held ACP session in-place or spawns a refined follow-up turn with the user's instruction.
+    @discardableResult
+    public func steer(id: String, instruction: String) -> Bool {
+        let trimmed = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        let warmAcpHandle: AcpLiveSessionHandle? = stateLock.withLock {
+            guard let rid = warmHoldApprovalToRunID[id] else { return nil }
+            return activeAcpHandles[rid]
+        }
+
+        guard let approval = (try? store.resolvePendingApprovalAtomically(id: id, status: "edited", comment: trimmed)) ?? nil else {
+            return false
+        }
+        callbacks.onApprovalUpdated()
+
+        if let warmAcpHandle, warmAcpHandle.resolvePermission(.steer(instruction: trimmed)) {
+            return true
+        }
+
+        guard let rule = funnel.currentRules().first(where: { $0.id == approval.chimeID }) else {
+            return true
+        }
+        let workingDir = approval.targetRepo ?? rule.workingDir
+        var refinedRule = rule
+        refinedRule.phase1Prompt = "\(rule.phase1Prompt)\n\n[Human Steer / 用户补充调整要求]: \(trimmed)"
+        let steerCorrKey = "steer:\(approval.id)"
+        if let extSID = approval.externalSessionID, !extSID.isEmpty {
+            if refinedRule.sessionPolicy == .ephemeral {
+                refinedRule.sessionPolicy = .threaded
+            }
+            let drvID = AgentDriverRegistry.driver(named: refinedRule.driver).id
+            try? store.upsertSession(
+                id: "ses-\(UUID().uuidString.prefix(8))",
+                correlationKey: steerCorrKey,
+                driver: drvID,
+                policy: refinedRule.sessionPolicy,
+                externalSessionID: extSID,
+                cwd: workingDir,
+                ttlSeconds: max(3600, refinedRule.sessionTTLSeconds)
+            )
+        }
+        let steerEvent = EventEnvelope(
+            source: "bz://steer/human",
+            type: "dev.bianzhong.steer",
+            correlationKey: steerCorrKey,
+            payload: [
+                "title": approval.title,
+                "body": "\(approval.proposedAction)\n\n[调整要求] \(trimmed)"
+            ],
+            ambientContext: .captureCurrent()
+        )
+        try? store.recordEvent(steerEvent, funnelStage: "dispatched", matchedChimeID: rule.id)
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            await self.runPhase1(event: steerEvent, rule: refinedRule, workingDir: workingDir)
+        }
+        return true
+    }
+
     private func performPhase2(approval: ApprovalRecord, rule: ChimeRule, extSession: String, comment: String?) async {
         let runID = "run-\(UUID().uuidString.prefix(8))"
         let driver = AgentDriverRegistry.driver(named: rule.driver)
@@ -1322,7 +1957,7 @@ public final class Orchestrator: @unchecked Sendable {
         let baseRepo = approval.targetRepo ?? rule.workingDir
 
         let execDir: String
-        if rule.worktreeOnPhase2 && driver.id != "codex" {
+        if rule.worktreeOnPhase2 && driver.id != "codex" && !Self.isSubpath(URL(fileURLWithPath: baseRepo), of: paths.worktreesDir) {
             execDir = TerminalLauncher.prepareWorktreeIfGitRepo(repoPath: baseRepo, runID: runID, worktreesDir: paths.worktreesDir)
         } else {
             execDir = baseRepo
@@ -1369,27 +2004,119 @@ public final class Orchestrator: @unchecked Sendable {
             status: "running"
         )
 
-        let procResult = await AgentProcessRunner.run(spec: driver.buildSpawnSpec(request: request), timeoutSeconds: rule.phase2MaxTimeSeconds)
-        let parsed = parseAgentStdout(procResult.stdout, driver: driver, initialSessionID: extSession)
-        let effectiveExtSession = parsed.externalSessionID ?? extSession
-        let finalStatus = procResult.timedOut ? "timeout" : (procResult.exitCode == 0 ? "succeeded" : (procResult.exitCode == 3 ? "budget_exceeded" : "failed"))
+        upsertLiveRun(
+            LiveRunSnapshot(
+                runID: runID,
+                chimeID: rule.id,
+                driver: driver.id,
+                phase: "execute",
+                title: approval.title,
+                workingDirectory: execDir,
+                startedAtMs: SQLiteStore.nowMs(),
+                status: "running",
+                currentActivity: "Phase 2 执行中 (\(driver.id))..."
+            )
+        )
+        defer { removeLiveRun(id: runID) }
 
-        let fallbackSummary = procResult.stderr.isEmpty ? String(procResult.stdout.suffix(2000)) : procResult.stderr
-        let rawSummary = parsed.finalText ?? (parsed.errorMessages.isEmpty ? fallbackSummary : parsed.errorMessages.joined(separator: "\n"))
-        let execSummary = rawSummary.isEmpty ? "Exit code: \(procResult.exitCode)" : String(rawSummary.prefix(3500))
+        let finalStatus: String
+        let exitCode: Int32
+        let execSummary: String
+        let effectiveExtSession: String
+        let inTok: Int
+        let outTok: Int
+        let cacheTok: Int
+        let costUSD: Double
+        let errText: String?
+        var capturedDiff: String?
+
+        if let acpDriver = driver as? AcpAgentDriver {
+            let acpHandle = AcpLiveSessionHandle(runID: runID)
+            stateLock.withLock { activeAcpHandles[runID] = acpHandle }
+            let throttle = StreamThrottleBox()
+            let acpOut = await AcpSessionRunner.run(
+                spec: acpDriver.buildAcpSpawnSpec(request: request),
+                request: request,
+                handle: acpHandle,
+                warmHoldTimeoutSeconds: rule.phase2MaxTimeSeconds,
+                onStreamUpdate: { [weak self] activity, fullText, diffSnap in
+                    guard let self else { return }
+                    let shouldNotify = activity != nil || throttle.shouldEmit()
+                    self.mutateLiveRun(id: runID, notify: shouldNotify) { snap in
+                        if let act = activity { snap.currentActivity = act }
+                        if !fullText.isEmpty { snap.streamPreview = String(fullText.suffix(800)) }
+                        if let diffSnap { snap.diffPreview = diffSnap }
+                    }
+                },
+                onWarmHoldPermission: { _ in .allowOnce(comment: comment) }
+            )
+            effectiveExtSession = acpOut.externalSessionID ?? extSession
+            exitCode = acpOut.exitCode
+            finalStatus = acpOut.cancelled ? "cancelled" : (acpOut.timedOut ? "timeout" : (acpOut.exitCode == 0 ? "succeeded" : "failed"))
+            let raw = acpOut.finalText.isEmpty ? (acpOut.errorMessage ?? "ACP Phase 2 completed") : acpOut.finalText
+            execSummary = String(raw.prefix(3500))
+            inTok = acpOut.inputTokens
+            outTok = acpOut.outputTokens
+            cacheTok = acpOut.cachedTokens
+            costUSD = acpOut.costUSD
+            errText = acpOut.errorMessage
+            capturedDiff = acpOut.diffPreview
+        } else {
+            let procHandle = ActiveProcessHandle()
+            stateLock.withLock { activeProcessHandles[runID] = procHandle }
+            let throttle = StreamThrottleBox()
+            let procResult = await AgentProcessRunner.run(
+                spec: driver.buildSpawnSpec(request: request),
+                timeoutSeconds: rule.phase2MaxTimeSeconds,
+                handle: procHandle
+            ) { [weak self] line in
+                guard let self else { return }
+                for ev in driver.parseStdoutLine(line) {
+                    switch ev {
+                    case .toolActivity(let name, _):
+                        self.mutateLiveRun(id: runID, notify: true) { $0.currentActivity = "⚡ \(name)" }
+                    case .textDelta(let chunk):
+                        self.mutateLiveRun(id: runID, notify: throttle.shouldEmit()) {
+                            $0.streamPreview = String(($0.streamPreview + chunk).suffix(800))
+                        }
+                    default: break
+                    }
+                }
+            }
+            let parsed = parseAgentStdout(procResult.stdout, driver: driver, initialSessionID: extSession)
+            effectiveExtSession = parsed.externalSessionID ?? extSession
+            exitCode = procResult.exitCode
+            finalStatus = procHandle.isCancelled ? "cancelled" : (procResult.timedOut ? "timeout" : (procResult.exitCode == 0 ? "succeeded" : (procResult.exitCode == 3 ? "budget_exceeded" : "failed")))
+            let fallbackSummary = procResult.stderr.isEmpty ? String(procResult.stdout.suffix(2000)) : procResult.stderr
+            let rawSummary = parsed.finalText ?? (parsed.errorMessages.isEmpty ? fallbackSummary : parsed.errorMessages.joined(separator: "\n"))
+            execSummary = rawSummary.isEmpty ? "Exit code: \(procResult.exitCode)" : String(rawSummary.prefix(3500))
+            inTok = parsed.inputTokens
+            outTok = parsed.outputTokens
+            cacheTok = parsed.cachedTokens
+            costUSD = parsed.costUSD
+            errText = procResult.exitCode == 0 ? nil : String((parsed.errorMessages.last ?? procResult.stderr).prefix(1000))
+        }
+        capturedDiff = capturedDiff ?? captureGitDiffPreview(in: execDir)
 
         try? store.updateRunStatus(
             id: runID,
             sessionID: approval.sessionID,
             status: finalStatus,
-            exitCode: procResult.exitCode,
-            inputTokens: parsed.inputTokens,
-            outputTokens: parsed.outputTokens,
-            cachedTokens: parsed.cachedTokens,
-            costUSD: parsed.costUSD,
+            exitCode: exitCode,
+            inputTokens: inTok,
+            outputTokens: outTok,
+            cachedTokens: cacheTok,
+            costUSD: costUSD,
             outputSummary: execSummary,
-            errorMessage: procResult.exitCode == 0 ? nil : String((parsed.errorMessages.last ?? procResult.stderr).prefix(1000))
+            errorMessage: errText
         )
+
+        guard finalStatus != "cancelled" else {
+            if execDir != baseRepo {
+                try? removeWorktree(at: execDir)
+            }
+            return
+        }
 
         if let sid = approval.sessionID {
             try? store.updateSessionAfterPhase2(
@@ -1435,7 +2162,8 @@ public final class Orchestrator: @unchecked Sendable {
             status: "pending",
             userComment: nil,
             createdAt: SQLiteStore.nowMs(),
-            resolvedAt: nil
+            resolvedAt: nil,
+            diffPreview: capturedDiff
         )
         try? store.insertApproval(execApproval)
         callbacks.onApprovalUpdated()
@@ -1462,6 +2190,7 @@ public final class Orchestrator: @unchecked Sendable {
     ) -> ParsedAgentOutput {
         var out = ParsedAgentOutput(externalSessionID: initialSessionID)
         var finalTexts: [String] = []
+        var deltaText = ""
         for line in stdout.components(separatedBy: .newlines) where !line.isEmpty {
             for ev in driver.parseStdoutLine(line) {
                 switch ev {
@@ -1473,6 +2202,8 @@ public final class Orchestrator: @unchecked Sendable {
                     if !txt.isEmpty {
                         finalTexts.append(txt)
                     }
+                case .textDelta(let chunk):
+                    deltaText += chunk
                 case .usageReported(let i, let o, let c, let cost):
                     out.inputTokens += i
                     out.outputTokens += o
@@ -1480,12 +2211,12 @@ public final class Orchestrator: @unchecked Sendable {
                     out.costUSD += cost ?? 0
                 case .error(let msg, _):
                     out.errorMessages.append(msg)
-                case .textDelta, .toolActivity:
+                case .toolActivity:
                     break
                 }
             }
         }
-        out.finalText = finalTexts.last
+        out.finalText = finalTexts.last ?? (deltaText.isEmpty ? nil : deltaText)
         return out
     }
 
@@ -1543,11 +2274,32 @@ public final class Orchestrator: @unchecked Sendable {
 
     @discardableResult
     public func reject(id: String, comment: String?) -> Bool {
+        let warmAcpHandle: AcpLiveSessionHandle? = stateLock.withLock {
+            guard let rid = warmHoldApprovalToRunID[id] else { return nil }
+            return activeAcpHandles[rid]
+        }
         guard ((try? store.resolvePendingApprovalAtomically(id: id, status: "rejected", comment: comment)) ?? nil) != nil else {
             return false
         }
+        _ = warmAcpHandle?.resolvePermission(.reject)
         callbacks.onApprovalUpdated()
         return true
+    }
+
+    @discardableResult
+    public func launchIDEHandoff(for approvalID: String, ide: TerminalLauncher.IDEApp) -> Bool {
+        guard let approval = try? store.getApproval(id: approvalID) else { return false }
+        let rule = funnel.currentRules().first(where: { $0.id == approval.chimeID })
+        let cwd = approval.targetRepo ?? rule?.workingDir ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let ok = TerminalLauncher.openInIDE(ide, directory: cwd)
+        if ok {
+            if let sid = approval.sessionID {
+                try? store.markSessionHandedOver(id: sid)
+            }
+            _ = try? store.resolvePendingApprovalAtomically(id: approvalID, status: "taken_over", comment: "Opened in \(ide.displayName)")
+            callbacks.onApprovalUpdated()
+        }
+        return ok
     }
 
     public func copyAndOpenFeishu(id: String) {
@@ -1606,6 +2358,30 @@ public final class Orchestrator: @unchecked Sendable {
         }
         return file
     }
+}
+
+private final class StreamThrottleBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastMs: Int64 = 0
+
+    func shouldEmit(minIntervalMs: Int64 = 180) -> Bool {
+        lock.withLock {
+            let now = SQLiteStore.nowMs()
+            if now - lastMs >= minIntervalMs {
+                lastMs = now
+                return true
+            }
+            return false
+        }
+    }
+}
+
+private final class LockedValueBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var val: T
+    init(_ initial: T) { self.val = initial }
+    func set(_ v: T) { lock.withLock { val = v } }
+    func get() -> T { lock.withLock { val } }
 }
 
 private extension JSONEncoder {

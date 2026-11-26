@@ -2180,6 +2180,477 @@ struct BianzhongCoreTests {
         let remainingMeta = (try? FileManager.default.contentsOfDirectory(atPath: wtMetaDir.path)) ?? []
         #expect(remainingMeta.isEmpty)
     }
+
+    @Test("25. v0.5.0 ACP warm-hold & inline steer, stopRun, Claude/OpenCode drivers, and Pocket PWA API")
+    func v050AcpWarmHoldSteerStopAndPocketPWA() async throws {
+        let shortID = String(UUID().uuidString.prefix(8))
+        let rootDir = URL(fileURLWithPath: "/tmp/bz-t25-\(shortID)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        let cfgDir = rootDir.appendingPathComponent("cfg", isDirectory: true)
+        let stateDir = rootDir.appendingPathComponent("state", isDirectory: true)
+        let workDir = rootDir.appendingPathComponent("repo", isDirectory: true)
+        let binDir = rootDir.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+
+        // (a) ClaudeDriver & OpenCodeDriver CLI spec & JSONL parser checks
+        let claudeReq = AgentInvocationRequest(
+            runID: "r1",
+            correlationKey: "ck1",
+            workingDirectory: workDir.path,
+            promptText: "diagnose",
+            eventFilePath: rootDir.appendingPathComponent("ev.json").path,
+            sessionDir: stateDir.path,
+            permissionProfile: .readOnly
+        )
+        let claudeDrv = ClaudeDriver()
+        let claudeSpec = claudeDrv.buildSpawnSpec(request: claudeReq)
+        #expect(claudeSpec.arguments.contains("--output-format"))
+        #expect(claudeSpec.arguments.contains("stream-json"))
+        #expect(claudeSpec.arguments.contains("plan"))
+        let claudeEvents = claudeDrv.parseStdoutLine(#"{"type":"result","session_id":"claude-ses-99","result":"Claude 根因结论","total_cost_usd":0.042,"usage":{"input_tokens":120,"output_tokens":35,"cache_read_input_tokens":10}}"#)
+        #expect(claudeEvents.contains(.sessionStarted(externalSessionID: "claude-ses-99")))
+        #expect(claudeEvents.contains(.finalAnswer(text: "Claude 根因结论")))
+
+        let ocDrv = OpenCodeDriver()
+        let ocEvents = ocDrv.parseStdoutLine(#"{"type":"step_finish","sessionID":"oc-ses-77","part":{"cost":0.015,"tokens":{"input":80,"output":20,"cache":{"read":5}}}}"#)
+        #expect(ocEvents.contains(.sessionStarted(externalSessionID: "oc-ses-77")))
+
+        // (b) AppConfig notch_hud_enabled roundtrip
+        let paths = BianzhongPaths(configDir: cfgDir, stateDir: stateDir)
+        try paths.ensureDirectories()
+        var initCfg = AppConfig()
+        initCfg.webhookServerEnabled = true
+        initCfg.webhookHost = "127.0.0.1"
+        initCfg.webhookPort = Int.random(in: 29100...29800)
+        initCfg.notchHUDEnabled = false
+        try AppConfig.save(initCfg, to: paths.configFile)
+        let reloadedCfg = AppConfig.load(from: paths.configFile)
+        #expect(reloadedCfg.notchHUDEnabled == false)
+
+        // (c) Mock ACP JSON-RPC 2.0 server script supporting initialize, session/new, session/prompt,
+        //     session/update (text + diff), session/request_permission warm-hold, and follow-up steer!
+        let mockAcpPy = binDir.appendingPathComponent("mock-acp-agent.py")
+        let pyScript = """
+        #!/usr/bin/env python3
+        import json, sys, os
+
+        turn = 0
+        for raw in sys.stdin:
+            raw = raw.strip()
+            if not raw:
+                continue
+            msg = json.loads(raw)
+            mid = msg.get("id")
+            method = msg.get("method", "")
+            if method == "initialize":
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}) + "\\n")
+                sys.stdout.flush()
+            elif method == "session/new":
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "acp-ses-live-1", "configOptions": [{"id": "mode"}]}}) + "\\n")
+                sys.stdout.flush()
+            elif method == "session/set_config_option":
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}) + "\\n")
+                sys.stdout.flush()
+            elif method == "session/prompt":
+                turn += 1
+                blocks = msg.get("params", {}).get("prompt", [])
+                prompt_text = blocks[0].get("text", "") if blocks else ""
+                if "STEER_MODE" in prompt_text or turn >= 2:
+                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "acp-ses-live-1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "已按指导调整方案：仅修改超时重试参数"}}}}) + "\\n")
+                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}) + "\\n")
+                    sys.stdout.flush()
+                else:
+                    # Stream a diff update + text chunk, then trigger warm-hold permission gate!
+                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "acp-ses-live-1", "update": {"sessionUpdate": "tool_call", "title": "Edit retry.swift", "content": [{"type": "diff", "path": "retry.swift", "oldText": "let retries = 1\\n", "newText": "let retries = 3\\n"}]}}}) + "\\n")
+                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "acp-ses-live-1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "定位到重试次数过低，准备应用补丁"}}}}) + "\\n")
+                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": "perm-req-1", "method": "session/request_permission", "params": {"sessionId": "acp-ses-live-1", "toolCall": {"title": "Write retry.swift"}, "options": [{"optionId": "allow-once", "kind": "allow_once"}, {"optionId": "reject-once", "kind": "reject_once"}]}}) + "\\n")
+                    sys.stdout.flush()
+                    # Wait in-place for client permission response!
+                    perm_line = sys.stdin.readline().strip()
+                    perm_resp = json.loads(perm_line) if perm_line else {}
+                    chosen = perm_resp.get("result", {}).get("outcome", {}).get("optionId", "")
+                    if chosen == "allow-once":
+                        with open(os.path.join("\(workDir.path)", "patched.txt"), "w") as f:
+                            f.write("warm_resumed_ok")
+                        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "acp-ses-live-1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": " · 热恢复补丁已落盘"}}}}) + "\\n")
+                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}) + "\\n")
+                    sys.stdout.flush()
+        """
+        try pyScript.write(to: mockAcpPy, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mockAcpPy.path)
+
+        let acpDriverID = "mock-acp-\(shortID)-acp"
+        AgentDriverRegistry.register(AcpAgentDriver(
+            id: acpDriverID,
+            executablePath: mockAcpPy.path,
+            acpArguments: []
+        ))
+        defer { AgentDriverRegistry.unregister(id: acpDriverID) }
+
+        let acpRule = """
+        ---
+        id: acp-warm-rule
+        enabled: true
+        match:
+          type: ["dev.bianzhong.acp.test"]
+        funnel:
+          debounce: 0s
+          cooldown: 0s
+          triage:
+            enabled: false
+            provider: none
+        execution:
+          autonomy: draft_approve
+          driver: \(acpDriverID)
+          working_dir: \(workDir.path)
+          worktree_on_phase2: false
+        on_complete:
+          - type: notify
+        ---
+        ## Phase 1
+        Inspect and patch retry.swift
+        """
+        try acpRule.write(to: paths.chimesDir.appendingPathComponent("acp-warm-rule.md"), atomically: true, encoding: .utf8)
+
+        // Also add a slow CLI rule to test 1-click stopRun(id:)
+        let slowDriverID = "mock-slow-\(shortID)"
+        struct SlowDriver: AgentDriver {
+            let id: String
+            func buildSpawnSpec(request: AgentInvocationRequest) -> SpawnSpec {
+                SpawnSpec(executablePath: "/bin/sleep", arguments: ["30"], workingDirectory: request.workingDirectory)
+            }
+            func parseStdoutLine(_ line: String) -> [NormalizedAgentEvent] { [] }
+            func isSuccessExit(exitCode: Int32, lastEvents: [NormalizedAgentEvent]) -> Bool { exitCode == 0 }
+            func buildTakeoverCommand(sessionID: String, sessionDir: String, workingDirectory: String) -> String { "echo hi" }
+        }
+        AgentDriverRegistry.register(SlowDriver(id: slowDriverID))
+        defer { AgentDriverRegistry.unregister(id: slowDriverID) }
+
+        let slowRule = """
+        ---
+        id: slow-cancel-rule
+        enabled: true
+        match:
+          type: ["dev.bianzhong.slow.test"]
+        funnel:
+          debounce: 0s
+          triage:
+            enabled: false
+            provider: none
+        execution:
+          autonomy: draft_approve
+          driver: \(slowDriverID)
+          working_dir: \(workDir.path)
+        ---
+        ## Phase 1
+        sleep
+        """
+        try slowRule.write(to: paths.chimesDir.appendingPathComponent("slow-cancel-rule.md"), atomically: true, encoding: .utf8)
+
+        let orch = try Orchestrator(paths: paths)
+        try orch.start(enableBuiltInSensors: false, enableWebhookServer: true)
+        defer { orch.stop() }
+
+        // Trigger ACP warm-hold flow
+        let ev1 = EventEnvelope(source: "bz://test", type: "dev.bianzhong.acp.test", correlationKey: "acp:1", payload: ["title": "ACP 故障信号", "body": "retry error"])
+        _ = orch.handleBusRequest(BusRequest(action: "emit", event: ev1))
+
+        for _ in 0..<80 {
+            if !orch.pendingApprovals().isEmpty { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let warmApr = try #require(orch.pendingApprovals().first)
+        #expect(orch.isWarmHeldApproval(warmApr.id) == true)
+        #expect(warmApr.diffPreview?.contains("+let retries = 3") == true)
+        #expect(orch.activeRuns().contains(where: { $0.status == "warm_hold" }))
+
+        // (d) Verify Mobile Pocket Console PWA & authenticated JSON API while warm-hold is live!
+        let tok = SecretStore.ensureWebhookToken(paths: paths)
+        let port = orch.webhookStatus().port
+        let (pwaBytes, pwaResp) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)/pocket")!)
+        #expect((pwaResp as? HTTPURLResponse)?.statusCode == 200)
+        #expect(String(decoding: pwaBytes, as: UTF8.self).contains("编钟 · 口袋控制台"))
+
+        let (_, unauthResp) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)/v1/pocket/state")!)
+        #expect((unauthResp as? HTTPURLResponse)?.statusCode == 401)
+
+        var stateReq = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/pocket/state")!)
+        stateReq.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+        let (stateBytes, stateResp) = try await URLSession.shared.data(for: stateReq)
+        #expect((stateResp as? HTTPURLResponse)?.statusCode == 200)
+        let stateObj = try #require(try JSONSerialization.jsonObject(with: stateBytes) as? [String: Any])
+        let apiActiveRuns = (stateObj["active_runs"] as? [[String: Any]]) ?? []
+        let apiApprovals = (stateObj["approvals"] as? [[String: Any]]) ?? []
+        #expect(apiActiveRuns.contains(where: { ($0["status"] as? String) == "warm_hold" }))
+        #expect((apiApprovals.first?["diffPreview"] as? String)?.contains("+let retries = 3") == true)
+
+        // Resume warm-held ACP session in-place (<5ms gate release, no Phase 2 cold spawn!)
+        #expect(orch.approve(id: warmApr.id, comment: "Approve warm") == true)
+        let patchedFile = workDir.appendingPathComponent("patched.txt")
+        for _ in 0..<60 {
+            if FileManager.default.fileExists(atPath: patchedFile.path) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect((try? String(contentsOf: patchedFile, encoding: .utf8)) == "warm_resumed_ok")
+
+        // Wait for completion notify card and test inline `steer(id:instruction:)`
+        for _ in 0..<60 {
+            if orch.pendingApprovals().contains(where: { $0.id != warmApr.id }) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let postWarmCard = try #require(orch.pendingApprovals().first(where: { $0.id != warmApr.id }))
+        #expect(orch.steer(id: postWarmCard.id, instruction: "STEER_MODE 请只改重试参数") == true)
+        for _ in 0..<80 {
+            if orch.pendingApprovals().contains(where: { $0.proposedAction.contains("已按指导调整方案") }) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(orch.pendingApprovals().contains(where: { $0.proposedAction.contains("已按指导调整方案") }))
+
+        // (e) Test 1-click stopRun(id:) on active slow run + Pocket API pause/resume
+        let slowEv = EventEnvelope(source: "bz://test", type: "dev.bianzhong.slow.test", correlationKey: "slow:1", payload: ["title": "Slow Run"])
+        _ = orch.handleBusRequest(BusRequest(action: "emit", event: slowEv))
+        for _ in 0..<40 {
+            if orch.activeRuns().contains(where: { $0.chimeID == "slow-cancel-rule" }) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let activeSlow = try #require(orch.activeRuns().first(where: { $0.chimeID == "slow-cancel-rule" }))
+        #expect(orch.stopRun(id: activeSlow.runID) == true)
+        for _ in 0..<40 {
+            if !orch.activeRuns().contains(where: { $0.runID == activeSlow.runID }) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(orch.recentRuns().first(where: { $0.id == activeSlow.runID })?.status == "cancelled")
+
+        var actReq = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/pocket/act")!)
+        actReq.httpMethod = "POST"
+        actReq.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+        actReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        actReq.httpBody = Data(#"{"action":"pause","seconds":60}"#.utf8)
+        let (_, actResp) = try await URLSession.shared.data(for: actReq)
+        #expect((actResp as? HTTPURLResponse)?.statusCode == 200)
+        #expect(orch.isPaused() == true)
+    }
+
+    @Test("26. v0.5.0 Code Review regressions: ACP worktree isolation & write-lease, ghost approval cleanup, Phase 2 cancel guard, steer session continuity, OpenCode plan/usage, and Pocket header-only auth")
+    func v050CodeReviewRegressions() async throws {
+        let shortID = String(UUID().uuidString.prefix(8))
+        let rootDir = URL(fileURLWithPath: "/tmp/bz-t26-\(shortID)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: rootDir) }
+
+        let cfgDir = rootDir.appendingPathComponent("cfg", isDirectory: true)
+        let stateDir = rootDir.appendingPathComponent("state", isDirectory: true)
+        let repoDir = rootDir.appendingPathComponent("repo", isDirectory: true)
+        let binDir = rootDir.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: repoDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+
+        func git(_ args: [String]) throws {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            p.arguments = ["-C", repoDir.path] + args
+            p.standardOutput = Pipe()
+            p.standardError = Pipe()
+            try p.run()
+            p.waitUntilExit()
+            #expect(p.terminationStatus == 0)
+        }
+        try git(["init", "-q"])
+        try git(["config", "user.email", "test@bianzhong.dev"])
+        try git(["config", "user.name", "Bianzhong Test"])
+        try "v1\n".write(to: repoDir.appendingPathComponent("app.txt"), atomically: true, encoding: .utf8)
+        try git(["add", "app.txt"])
+        try git(["commit", "-q", "-m", "initial"])
+
+        // (a) OpenCodeDriver permission flags (`--agent plan` vs `--auto`) & `step_finish` usage accounting
+        let oc = OpenCodeDriver()
+        let roSpec = oc.buildSpawnSpec(request: AgentInvocationRequest(
+            runID: "r-ro", correlationKey: "c", workingDirectory: repoDir.path,
+            promptText: "plan", eventFilePath: "/tmp/e.json", sessionDir: stateDir.path, permissionProfile: .readOnly
+        ))
+        #expect(roSpec.arguments.contains("--agent"))
+        #expect(roSpec.arguments.contains("plan"))
+        #expect(!roSpec.arguments.contains("--auto"))
+
+        let rwSpec = oc.buildSpawnSpec(request: AgentInvocationRequest(
+            runID: "r-rw", correlationKey: "c", workingDirectory: repoDir.path,
+            promptText: "exec", eventFilePath: "/tmp/e.json", sessionDir: stateDir.path, permissionProfile: .workspaceRW
+        ))
+        #expect(rwSpec.arguments.contains("--auto"))
+
+        let stepEvs = oc.parseStdoutLine(#"{"type":"step_finish","sessionID":"oc-s1","part":{"cost":0.025,"tokens":{"input":100,"output":30,"cache":{"read":12}}}}"#)
+        #expect(stepEvs.contains(.usageReported(input: 100, output: 30, cached: 12, costUSD: 0.025)))
+
+        // (b) ACP driver with STRING JSON-RPC response IDs + usage reporting + cwd writing (`worktree_on_phase2: true` isolation!)
+        let acpScriptURL = binDir.appendingPathComponent("mock-acp-wt.py")
+        let py = """
+        #!/usr/bin/env python3
+        import json, sys, os
+
+        for raw in sys.stdin:
+            raw = raw.strip()
+            if not raw:
+                continue
+            msg = json.loads(raw)
+            mid = str(msg.get("id", ""))
+            method = msg.get("method", "")
+            if method == "initialize":
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}}) + "\\n")
+                sys.stdout.flush()
+            elif method == "session/load":
+                sid = msg.get("params", {}).get("sessionId", "resumed")
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": sid}}) + "\\n")
+                sys.stdout.flush()
+            elif method == "session/new":
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "acp-wt-ses-1"}}) + "\\n")
+                sys.stdout.flush()
+            elif method == "session/prompt":
+                blocks = msg.get("params", {}).get("prompt", [])
+                txt = blocks[0].get("text", "") if blocks else ""
+                if "[Human Steer / 用户补充调整要求]: FOLLOWUP_STEER" in txt:
+                    used_sid = msg.get("params", {}).get("sessionId", "")
+                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": used_sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": f"RESUMED_OK:{used_sid}"}}}}) + "\\n")
+                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 50, "outputTokens": 15, "costUSD": 0.01}}}) + "\\n")
+                    sys.stdout.flush()
+                    continue
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": "perm-wt", "method": "session/request_permission", "params": {"sessionId": "acp-wt-ses-1", "toolCall": {"title": "Write isolated.txt"}, "options": [{"optionId": "allow-1", "kind": "allow_once"}]}}) + "\\n")
+                sys.stdout.flush()
+                ans_line = sys.stdin.readline().strip()
+                if not ans_line:
+                    break
+                ans = json.loads(ans_line)
+                opt = ans.get("result", {}).get("outcome", {}).get("optionId", "")
+                if opt == "allow-1":
+                    with open(os.path.join(os.getcwd(), "isolated.txt"), "w") as f:
+                        f.write("in_worktree_only")
+                    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "acp-wt-ses-1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Worktree edit complete"}}}}) + "\\n")
+                sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 120, "outputTokens": 40, "costUSD": 0.03}}}) + "\\n")
+                sys.stdout.flush()
+        """
+        try py.write(to: acpScriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: acpScriptURL.path)
+
+        let acpDrvID = "mock-acp-wt-\(shortID)-acp"
+        AgentDriverRegistry.register(AcpAgentDriver(id: acpDrvID, executablePath: acpScriptURL.path))
+        defer { AgentDriverRegistry.unregister(id: acpDrvID) }
+
+        let paths = BianzhongPaths(configDir: cfgDir, stateDir: stateDir)
+        try paths.ensureDirectories()
+        var cfg = AppConfig()
+        cfg.webhookServerEnabled = true
+        cfg.webhookHost = "127.0.0.1"
+        cfg.webhookPort = Int.random(in: 29900...30800)
+        try AppConfig.save(cfg, to: paths.configFile)
+
+        let wtRule = """
+        ---
+        id: acp-wt-isolated
+        enabled: true
+        match:
+          type: ["dev.bianzhong.wt.test"]
+        funnel:
+          debounce: 0s
+          cooldown: 0s
+          triage:
+            enabled: false
+            provider: none
+        session:
+          policy: ephemeral
+        execution:
+          autonomy: draft_approve
+          driver: \(acpDrvID)
+          working_dir: \(repoDir.path)
+          worktree_on_phase2: true
+        on_complete:
+          - type: notify
+        ---
+        ## Phase 1
+        edit isolated.txt
+        """
+        try wtRule.write(to: paths.chimesDir.appendingPathComponent("acp-wt-isolated.md"), atomically: true, encoding: .utf8)
+
+        let orch = try Orchestrator(paths: paths)
+        try orch.start(enableBuiltInSensors: false, enableWebhookServer: true)
+        defer { orch.stop() }
+
+        // Run 1: Warm-hold inside isolated worktree -> approve -> verify main repo stays untouched!
+        _ = orch.handleBusRequest(BusRequest(action: "emit", event: EventEnvelope(
+            source: "bz://test", type: "dev.bianzhong.wt.test", correlationKey: "wt:1", payload: ["title": "WT Isolation"]
+        )))
+        for _ in 0..<80 {
+            if !orch.pendingApprovals().isEmpty { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let warm1 = try #require(orch.pendingApprovals().first)
+        let assignedWT = try #require(warm1.targetRepo)
+        #expect(assignedWT != repoDir.path)
+        #expect(assignedWT.contains("/worktrees/"))
+
+        #expect(orch.approve(id: warm1.id, comment: "go") == true)
+        for _ in 0..<80 {
+            if orch.recentRuns().contains(where: { $0.status == "succeeded" }) && !orch.pendingApprovals().isEmpty { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        // Main checkout must remain 100% clean; isolated worktree has `isolated.txt`!
+        #expect(FileManager.default.fileExists(atPath: repoDir.appendingPathComponent("isolated.txt").path) == false)
+        #expect(FileManager.default.fileExists(atPath: URL(fileURLWithPath: assignedWT).appendingPathComponent("isolated.txt").path) == true)
+        #expect(abs((orch.recentRuns().first?.costUSD ?? 0) - 0.03) < 0.0001)
+
+        // (c) Non-warm-hold `steer()` preserves `externalSessionID` even when rule originally had `ephemeral` policy!
+        let doneCard = try #require(orch.pendingApprovals().first)
+        #expect(doneCard.externalSessionID == "acp-wt-ses-1")
+        #expect(orch.steer(id: doneCard.id, instruction: "FOLLOWUP_STEER") == true)
+        for _ in 0..<80 {
+            if orch.pendingApprovals().contains(where: { $0.proposedAction.contains("RESUMED_OK:acp-wt-ses-1") }) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let steeredCard = try #require(orch.pendingApprovals().first(where: { $0.proposedAction.contains("RESUMED_OK:acp-wt-ses-1") }))
+        _ = orch.reject(id: steeredCard.id, comment: "done")
+
+        // (d) Stopping a warm-held ACP run via `stopRun(id:)` expires its pending approval (no ghost inbox card) & prunes clean worktree!
+        _ = orch.handleBusRequest(BusRequest(action: "emit", event: EventEnvelope(
+            source: "bz://test", type: "dev.bianzhong.wt.test", correlationKey: "wt:2", payload: ["title": "Ghost Check"]
+        )))
+        for _ in 0..<80 {
+            if !orch.pendingApprovals().isEmpty { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let ghostCandidate = try #require(orch.pendingApprovals().first)
+        let cancelWT = try #require(ghostCandidate.targetRepo)
+        #expect(orch.stopRun(id: ghostCandidate.runID) == true)
+        for _ in 0..<60 {
+            if orch.activeRuns().isEmpty { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(orch.pendingApprovals().isEmpty)
+        #expect((try orch.store.getApproval(id: ghostCandidate.id))?.status == "expired")
+        #expect(FileManager.default.fileExists(atPath: cancelWT) == false)
+
+        // (e) Pocket API rejects query `?token=` (CSRF defense), emits `Cache-Control: no-store`, and honors `seconds` in `pause`
+        let tok = SecretStore.ensureWebhookToken(paths: paths)
+        let port = orch.webhookStatus().port
+        let (_, queryAuthResp) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)/v1/pocket/state?token=\(tok)")!)
+        #expect((queryAuthResp as? HTTPURLResponse)?.statusCode == 401)
+
+        var headerReq = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/pocket/state")!)
+        headerReq.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+        let (_, headerResp) = try await URLSession.shared.data(for: headerReq)
+        let httpHeaderResp = try #require(headerResp as? HTTPURLResponse)
+        #expect(httpHeaderResp.statusCode == 200)
+        #expect(httpHeaderResp.value(forHTTPHeaderField: "Cache-Control") == "no-store")
+
+        var shortPauseReq = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/pocket/act")!)
+        shortPauseReq.httpMethod = "POST"
+        shortPauseReq.setValue("Bearer \(tok)", forHTTPHeaderField: "Authorization")
+        shortPauseReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        shortPauseReq.httpBody = Data(#"{"action":"pause","seconds":0.25}"#.utf8)
+        let (_, pauseResp) = try await URLSession.shared.data(for: shortPauseReq)
+        #expect((pauseResp as? HTTPURLResponse)?.statusCode == 200)
+        #expect(orch.isPaused() == true)
+        try await Task.sleep(for: .milliseconds(400))
+        #expect(orch.isPaused() == false)
+    }
 }
 
 private extension ChimeRule {

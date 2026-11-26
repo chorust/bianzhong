@@ -1,5 +1,6 @@
 import AppKit
 import BianzhongCore
+import CoreImage
 import Foundation
 import ServiceManagement
 import SwiftUI
@@ -15,11 +16,22 @@ enum ConsoleSection: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .general: return "通用与终端"
-        case .rules: return "规则工作台"
-        case .events: return "信号漏斗透视"
-        case .webhooks: return "Webhook 与密钥"
-        case .runs: return "运行与 Worktree"
+        case .general: return "通用"
+        case .rules: return "规则"
+        case .events: return "事件"
+        case .webhooks: return "集成"
+        case .runs: return "运行"
+        }
+    }
+
+    static func resolve(_ raw: String) -> ConsoleSection? {
+        switch raw.lowercased() {
+        case "general", "settings": return .general
+        case "rules", "rule": return .rules
+        case "events", "event", "logs": return .events
+        case "webhooks", "webhook", "integrations", "integration": return .webhooks
+        case "runs", "run", "worktrees": return .runs
+        default: return ConsoleSection(rawValue: raw.lowercased())
         }
     }
 
@@ -43,7 +55,7 @@ struct ConsoleWindowView: View {
                 Label(section.title, systemImage: section.icon)
                     .tag(section)
             }
-            .navigationSplitViewColumnWidth(min: 175, ideal: 190, max: 220)
+            .navigationSplitViewColumnWidth(min: 145, ideal: 160, max: 190)
         } detail: {
             Group {
                 switch model.consoleSection {
@@ -83,53 +95,44 @@ private struct GeneralSettingsPane: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("通用与终端设置")
-                            .font(.title2.bold())
-                        Text("管理默认终端、开机自启、L1 语义分诊、预算护栏与候选工作区")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text("通用")
+                        .font(.title2.bold())
                     Spacer()
                     if let toast = saveToast {
                         Text(toast)
                             .font(.caption)
                             .foregroundStyle(.green)
                     }
-                    Button("保存配置") {
+                    Button("保存") {
                         saveDraft()
                     }
                     .buttonStyle(.borderedProminent)
                 }
 
-                GroupBox("终端与系统集成") {
-                    VStack(alignment: .leading, spacing: 12) {
+                GroupBox("基础") {
+                    VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("默认接管终端")
-                                    .font(.subheadline.bold())
-                                Text("点击「终端接管 ↗」或运行配置助手时拉起的终端应用")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
+                            Text("默认终端")
+                                .font(.subheadline)
                             Spacer()
                             Picker("", selection: $draftConfig.terminal) {
                                 let autoDetected = TerminalLauncher.detectTerminal(preference: "auto").displayName
-                                Text("自动检测（当前：\(autoDetected)）").tag("auto")
+                                Text("自动（\(autoDetected)）").tag("auto")
                                 Divider()
                                 ForEach(TerminalLauncher.TerminalApp.allCases) { app in
-                                    Text(app.isInstalled ? app.displayName : "\(app.displayName)（未检测到）")
+                                    Text(app.isInstalled ? app.displayName : "\(app.displayName)（未安装）")
                                         .tag(app.rawValue)
                                 }
                             }
-                            .frame(width: 240)
+                            .labelsHidden()
+                            .frame(width: 210)
                             .onChange(of: draftConfig.terminal) { _, newVal in
                                 guard newVal != model.preferredTerminal else { return }
                                 model.orchestrator.setPreferredTerminal(newVal)
                                 model.refresh()
                             }
 
-                            Button("测试打开") {
+                            Button("测试") {
                                 _ = TerminalLauncher.openInteractiveShell(
                                     at: model.orchestrator.paths.configDir.path,
                                     preferredTerminal: draftConfig.terminal
@@ -141,13 +144,8 @@ private struct GeneralSettingsPane: View {
                         Divider()
 
                         HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("登录 macOS 时自动启动 Bianzhong")
-                                    .font(.subheadline.bold())
-                                Text("使用 macOS 原生 SMAppService 管理后台常驻登录项")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
+                            Text("开机自动启动")
+                                .font(.subheadline)
                             Spacer()
                             Toggle("", isOn: Binding(
                                 get: { launchAtLogin },
@@ -159,17 +157,22 @@ private struct GeneralSettingsPane: View {
 
                         Divider()
 
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("飞书通知中心只读监听")
-                                    .font(.subheadline.bold())
-                                Text(feishuStatusLine)
+                        HStack(spacing: 8) {
+                            Text("飞书通知监听")
+                                .font(.subheadline)
+                            if model.feishuEnabled && model.feishuStatus == .needsFullDiskAccess {
+                                Text("缺少完全磁盘访问权限")
                                     .font(.caption2)
-                                    .foregroundStyle(model.feishuStatus == .needsFullDiskAccess ? .orange : .secondary)
+                                    .foregroundStyle(.orange)
+                            } else if model.feishuEnabled && model.feishuStatus == .unavailable {
+                                Text(model.feishuErrorMessage ?? "暂不可读")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                    .lineLimit(1)
                             }
                             Spacer()
                             if model.feishuEnabled && model.feishuStatus == .needsFullDiskAccess {
-                                Button("授予完全磁盘访问权限 ↗") {
+                                Button("去授权 ↗") {
                                     model.presentFDAGuideAlert(allowSuppression: false)
                                 }
                                 .controlSize(.small)
@@ -188,13 +191,30 @@ private struct GeneralSettingsPane: View {
                         Divider()
 
                         HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Zsh 慢命令失败钩子 (~/.zshrc)")
-                                    .font(.subheadline.bold())
-                                Text("自动上报耗时 ≥15s 且非 Ctrl+C 中断的失败命令")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                            Text("刘海悬浮窗 (⌥Space)")
+                                .font(.subheadline)
+                            Spacer()
+                            Button("预览") {
+                                model.notchHUD.previewDemo()
                             }
+                            .controlSize(.small)
+                            .disabled(!model.notchHUDEnabled)
+                            Toggle("", isOn: Binding(
+                                get: { model.notchHUDEnabled },
+                                set: {
+                                    draftConfig.notchHUDEnabled = $0
+                                    model.setNotchHUD(enabled: $0)
+                                }
+                            ))
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                        }
+
+                        Divider()
+
+                        HStack {
+                            Text("Zsh 慢命令钩子")
+                                .font(.subheadline)
                             Spacer()
                             Toggle("", isOn: Binding(
                                 get: { model.cliStatus.isZshHookInstalled },
@@ -207,31 +227,35 @@ private struct GeneralSettingsPane: View {
                     .padding(8)
                 }
 
-                GroupBox("L1 语义分诊与运行护栏") {
+                GroupBox("分诊与限额") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Text("默认 L1 分诊器")
-                                .frame(width: 140, alignment: .leading)
+                            Text("L1 分诊器")
+                                .frame(width: 110, alignment: .leading)
                             Picker("", selection: $draftConfig.triageProvider) {
-                                Text("Apple 端侧模型 (apple_fm · 0 费用)").tag("apple_fm")
-                                Text("本地 CLI 轻量模型 (agent_cli)").tag("agent_cli")
-                                Text("外部 HTTP 决策接口 (decision_api)").tag("decision_api")
-                                Text("不启用分诊 (none)").tag("none")
+                                Text("Apple 端侧模型 (apple_fm)").tag("apple_fm")
+                                Text("本地 CLI (agent_cli)").tag("agent_cli")
+                                Text("HTTP 接口 (decision_api)").tag("decision_api")
+                                Text("关闭 (none)").tag("none")
                             }
-                            .frame(width: 280)
+                            .labelsHidden()
+                            .frame(width: 240)
                             Spacer()
                         }
 
                         if draftConfig.triageProvider == "agent_cli" {
                             HStack {
-                                Text("分诊 CLI 与模型")
-                                    .frame(width: 140, alignment: .leading)
+                                Text("CLI 与模型")
+                                    .frame(width: 110, alignment: .leading)
                                 Picker("", selection: $draftConfig.agentCLIDriver) {
                                     Text("omp").tag("omp")
+                                    Text("claude").tag("claude")
+                                    Text("opencode").tag("opencode")
                                     Text("codex").tag("codex")
                                 }
-                                .frame(width: 110)
-                                TextField("轻量模型名（如 smol / gpt-5-mini）", text: Binding(
+                                .labelsHidden()
+                                .frame(width: 115)
+                                TextField("模型名（如 smol / gpt-5-mini）", text: Binding(
                                     get: { draftConfig.agentCLIModel ?? "" },
                                     set: { draftConfig.agentCLIModel = $0.isEmpty ? nil : $0 }
                                 ))
@@ -241,16 +265,16 @@ private struct GeneralSettingsPane: View {
                             }
                         } else if draftConfig.triageProvider == "decision_api" {
                             HStack {
-                                Text("Decision API URL")
-                                    .frame(width: 140, alignment: .leading)
+                                Text("接口地址")
+                                    .frame(width: 110, alignment: .leading)
                                 TextField("https://example.com/v1/triage", text: Binding(
                                     get: { draftConfig.decisionAPIURL ?? "" },
                                     set: { draftConfig.decisionAPIURL = $0.isEmpty ? nil : $0 }
                                 ))
                                 .textFieldStyle(.roundedBorder)
-                                TextField("密钥名", text: $draftConfig.decisionAPIKeyEnv)
+                                TextField("密钥变量名", text: $draftConfig.decisionAPIKeyEnv)
                                     .textFieldStyle(.roundedBorder)
-                                    .frame(width: 210)
+                                    .frame(width: 200)
                             }
                         }
 
@@ -258,25 +282,25 @@ private struct GeneralSettingsPane: View {
 
                         HStack(spacing: 20) {
                             HStack {
-                                Text("每日预算上限 ($)")
+                                Text("日预算 ($)")
                                 TextField("3.0", value: $draftConfig.dailyMaxCostUSD, format: .number)
                                     .textFieldStyle(.roundedBorder)
-                                    .frame(width: 72)
+                                    .frame(width: 68)
                             }
                             HStack {
-                                Text("每日最大运行数")
+                                Text("日运行上限")
                                 TextField("30", value: $draftConfig.dailyMaxRuns, format: .number)
                                     .textFieldStyle(.roundedBorder)
-                                    .frame(width: 64)
+                                    .frame(width: 60)
                             }
                             HStack {
-                                Text("连续失败熔断")
+                                Text("失败熔断")
                                 TextField("3", value: $draftConfig.circuitBreakerFailures, format: .number)
                                     .textFieldStyle(.roundedBorder)
-                                    .frame(width: 56)
+                                    .frame(width: 52)
                             }
                             HStack {
-                                Text("并发上限")
+                                Text("最大并发")
                                 TextField("2", value: $draftConfig.maxConcurrentRuns, format: .number)
                                     .textFieldStyle(.roundedBorder)
                                     .frame(width: 52)
@@ -287,12 +311,8 @@ private struct GeneralSettingsPane: View {
                     .padding(8)
                 }
 
-                GroupBox("候选本地工作区 (Workspaces)") {
+                GroupBox("工作区") {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("供 L1 分诊自动路由工作目录或规则参考")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-
                         ForEach(Array(draftConfig.workspaces.enumerated()), id: \.offset) { idx, ws in
                             HStack {
                                 Text(ws.name)
@@ -364,15 +384,10 @@ private struct GeneralSettingsPane: View {
                 draftConfig.feishuSensorEnabled = updatedFeishu
             }
         }
-    }
-
-    private var feishuStatusLine: String {
-        guard model.feishuEnabled else { return "当前已关闭" }
-        switch model.feishuStatus {
-        case .watching: return "已连接（实时监听 com.electron.lark 通知）"
-        case .needsFullDiskAccess: return "缺少完全磁盘访问权限，点击右侧授权"
-        case .unavailable: return model.feishuErrorMessage ?? "通知数据库暂不可读"
-        case .disabled: return "已关闭"
+        .onChange(of: model.notchHUDEnabled) { _, updatedNotch in
+            if draftConfig.notchHUDEnabled != updatedNotch {
+                draftConfig.notchHUDEnabled = updatedNotch
+            }
         }
     }
 
@@ -576,22 +591,22 @@ private struct RulesWorkbenchPane: View {
                                 .padding(6)
                             }
 
-                            GroupBox("L0 分字段匹配条件（多项之间为 AND 关系，逗号分隔列表项）") {
+                            GroupBox("匹配条件（逗号分隔）") {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    labeledField("事件类型 type", "dev.bianzhong.feishu.notification", $typesText)
-                                    labeledField("来源 source", "bz://sensor/feishu", $sourcesText)
-                                    labeledField("标题精确等于", "例如：支付研发群, 核心告警群", $titleEqualsText)
-                                    labeledField("标题包含任一", "例如：研发, 值班", $titleAnyText)
-                                    labeledField("正文包含任一", "例如：报错, 500, 超时", $bodyAnyText)
-                                    labeledField("正文必须全含", "例如：退款, 线上", $bodyAllText)
-                                    labeledField("全文任一关键词", "留空不限", $keywordsAnyText)
-                                    labeledField("排除词 (拦截)", "例如：收到, 辛苦, 演练", $excludeKeywordsText)
+                                    labeledField("事件类型", "dev.bianzhong.feishu.notification", $typesText)
+                                    labeledField("来源", "bz://sensor/feishu", $sourcesText)
+                                    labeledField("标题等于", "支付研发群, 核心告警群", $titleEqualsText)
+                                    labeledField("标题包含", "研发, 值班", $titleAnyText)
+                                    labeledField("正文包含任一", "报错, 500, 超时", $bodyAnyText)
+                                    labeledField("正文必须全含", "退款, 线上", $bodyAllText)
+                                    labeledField("全文关键词", "留空不限", $keywordsAnyText)
+                                    labeledField("排除词", "收到, 辛苦, 演练", $excludeKeywordsText)
                                 }
                                 .font(.caption)
                                 .padding(6)
                             }
 
-                            GroupBox("漏斗阈值与预期时间窗口 (Watchdog)") {
+                            GroupBox("频控与时间窗") {
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack(spacing: 14) {
                                         HStack {
@@ -610,13 +625,13 @@ private struct RulesWorkbenchPane: View {
                                                 .textFieldStyle(.roundedBorder).frame(width: 60)
                                         }
                                         HStack {
-                                            Text("累计达 N 次触发")
+                                            Text("触发次数")
                                             Stepper("\(draftRule.minCount)", value: $draftRule.minCount, in: 1...50)
                                         }
                                     }
                                     Divider()
                                     HStack(spacing: 12) {
-                                        Toggle("启用预期窗口看门狗（窗口内未收到上述匹配消息则触发告警）", isOn: $expectEnabled)
+                                        Toggle("预期时间窗未收到时告警", isOn: $expectEnabled)
                                         if expectEnabled {
                                             TextField("09:00", text: $expectStart)
                                                 .textFieldStyle(.roundedBorder).frame(width: 64)
@@ -630,16 +645,24 @@ private struct RulesWorkbenchPane: View {
                                 .padding(6)
                             }
 
-                            GroupBox("Agent 调度与出站 Webhook 动作") {
+                            GroupBox("执行与动作") {
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack(spacing: 12) {
-                                        Text("执行驱动").frame(width: 80, alignment: .leading)
+                                        Text("驱动").frame(width: 80, alignment: .leading)
                                         Picker("", selection: $draftRule.driver) {
+                                            Text("omp-acp (热挂起)").tag("omp-acp")
+                                            Text("opencode-acp (热挂起)").tag("opencode-acp")
+                                            Text("claude-acp (ACP)").tag("claude-acp")
+                                            Divider()
                                             Text("omp").tag("omp")
+                                            Text("claude").tag("claude")
+                                            Text("opencode").tag("opencode")
                                             Text("codex").tag("codex")
-                                            Text("纯动作 (none，不调大模型)").tag("none")
+                                            Divider()
+                                            Text("纯动作 (none)").tag("none")
                                         }
-                                        .frame(width: 200)
+                                        .labelsHidden()
+                                        .frame(width: 185)
 
                                         Toggle("Phase 2 隔离 Worktree", isOn: $draftRule.worktreeOnPhase2)
                                     }
@@ -657,14 +680,15 @@ private struct RulesWorkbenchPane: View {
                                     HStack {
                                         Text("出站 Webhook").frame(width: 80, alignment: .leading)
                                         Picker("", selection: $webhookPreset) {
-                                            Text("不额外发 Webhook").tag("off")
+                                            Text("关闭").tag("off")
                                             ForEach(WebhookPreset.allCases) { p in
                                                 Text(p.displayName).tag(p.rawValue)
                                             }
                                         }
+                                        .labelsHidden()
                                         .frame(width: 190)
                                         if webhookPreset != "off" {
-                                            TextField("URL 或密钥变量名（如 BIANZHONG_WEBHOOK_URL）", text: $webhookURLOrEnv)
+                                            TextField("URL 或密钥名（如 BIANZHONG_WEBHOOK_URL）", text: $webhookURLOrEnv)
                                                 .textFieldStyle(.roundedBorder)
                                             if webhookPreset == "feishu_bot" {
                                                 TextField("签名密钥名(可选)", text: $webhookSecretEnv)
@@ -673,14 +697,14 @@ private struct RulesWorkbenchPane: View {
                                             }
                                         }
                                     }
-                                    Text("Phase 1 提示词（只读勘察指令）")
+                                    Text("Phase 1 提示词（只读）")
                                         .font(.caption.bold())
                                     TextEditor(text: $draftRule.phase1Prompt)
                                         .font(.caption)
                                         .frame(height: 76)
                                         .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.2)))
 
-                                    Text("Phase 2 提示词（人类批准后执行指令，留空表示无需第二阶段）")
+                                    Text("Phase 2 提示词（可选）")
                                         .font(.caption.bold())
                                     TextEditor(text: $draftRule.phase2Prompt)
                                         .font(.caption)
@@ -923,13 +947,8 @@ private struct EventInspectorPane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("信号漏斗实时透视")
-                        .font(.title2.bold())
-                    Text("追踪每一条进入 Bianzhong 的本地信号在 L0/L1 各层的匹配、去重、累计或唤醒轨迹")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Text("事件")
+                    .font(.title2.bold())
                 Spacer()
                 Button {
                     reloadAudit()
@@ -940,21 +959,21 @@ private struct EventInspectorPane: View {
             }
 
             HStack(spacing: 10) {
-                TextField("搜索标题、群名、来源、规则 ID 或拦截原因...", text: $model.auditSearchQuery)
+                TextField("搜索标题、来源、规则或原因...", text: $model.auditSearchQuery)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { reloadAudit() }
 
                 Picker("阶段", selection: $model.auditStageFilter) {
-                    Text("全部阶段").tag("all")
-                    Text("已放行 / 唤醒 (dispatched)").tag("dispatched")
-                    Text("防抖合并中 (coalesced)").tag("coalesced")
-                    Text("阈值累计中 (dropped_threshold)").tag("dropped_threshold")
-                    Text("预期窗口已满足 (expect_satisfied)").tag("expect_satisfied")
-                    Text("预期窗口超时告警 (expect_missed)").tag("expect_missed")
-                    Text("规则未命中 (dropped_rule)").tag("dropped_rule")
-                    Text("全部已拦截").tag("dropped")
+                    Text("全部").tag("all")
+                    Text("已触发 (dispatched)").tag("dispatched")
+                    Text("合并中 (coalesced)").tag("coalesced")
+                    Text("计数中 (dropped_threshold)").tag("dropped_threshold")
+                    Text("窗口已满足 (expect_satisfied)").tag("expect_satisfied")
+                    Text("超时未达 (expect_missed)").tag("expect_missed")
+                    Text("未命中 (dropped_rule)").tag("dropped_rule")
+                    Text("全部拦截").tag("dropped")
                 }
-                .frame(width: 240)
+                .frame(width: 220)
                 .onChange(of: model.auditStageFilter) { _, _ in reloadAudit() }
             }
 
@@ -1055,28 +1074,112 @@ private struct WebhooksAndSecretsPane: View {
 
     @State private var newSecretKey = ""
     @State private var newSecretVal = ""
+    @State private var showPocketQR = false
+    @State private var isTogglingTailscale = false
+    @State private var tailscaleMessage: String?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("双向 Webhook 网关与安全密钥中心")
+                Text("集成")
                     .font(.title2.bold())
 
-                GroupBox("入站 HTTP Webhook 与 URL Scheme（供外部应用调用 Bianzhong）") {
+                GroupBox("手机控制台 (Tailscale)") {
+                    let ts = model.tailscaleStatus
+                    let localPort = Int(model.webhookStatus.port > 0 ? model.webhookStatus.port : UInt16(clamping: whPort))
+                    let basePocket = ts.pocketURL ?? "http://127.0.0.1:\(localPort)/pocket"
+                    let pairingURL = "\(basePocket)#token=\(model.webhookToken)"
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 10) {
+                            Circle()
+                                .fill(ts.serveEnabled ? Color.green : (ts.isRunning ? Color.blue : Color.secondary))
+                                .frame(width: 8, height: 8)
+                            Text(ts.installed ? (ts.dnsName ?? ts.backendState) : "未安装 Tailscale")
+                                .font(.caption.monospaced())
+                            if ts.serveEnabled {
+                                Text("已映射私网 HTTPS")
+                                    .font(.caption2)
+                                    .foregroundStyle(.green)
+                            }
+                            Spacer()
+                            Button(showPocketQR ? "收起二维码" : "扫码配对") {
+                                showPocketQR.toggle()
+                            }
+                            .controlSize(.small)
+
+                            Button("复制配对链接") {
+                                copyToPasteboard(pairingURL, concealed: true)
+                                tailscaleMessage = "✓ 已复制带令牌配对链接"
+                            }
+                            .controlSize(.small)
+
+                            Button("打开") {
+                                if let u = URL(string: pairingURL) {
+                                    NSWorkspace.shared.open(u)
+                                }
+                            }
+                            .controlSize(.small)
+
+                            if ts.installed {
+                                Button(isTogglingTailscale ? "配置中..." : (ts.serveEnabled ? "关闭映射" : "开启映射")) {
+                                    isTogglingTailscale = true
+                                    Task {
+                                        let targetEnable = !ts.serveEnabled
+                                        tailscaleMessage = await model.setTailscaleServe(enabled: targetEnable)
+                                        isTogglingTailscale = false
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .disabled(isTogglingTailscale || !ts.isRunning)
+                            }
+                        }
+
+                        if let tsMsg = tailscaleMessage ?? ts.errorMessage, !tsMsg.isEmpty {
+                            Text(tsMsg)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if showPocketQR, let qr = makeQRCodeImage(from: pairingURL, size: 136) {
+                            HStack(spacing: 14) {
+                                Image(nsImage: qr)
+                                    .interpolation(.none)
+                                    .resizable()
+                                    .frame(width: 136, height: 136)
+                                    .padding(6)
+                                    .background(Color.white)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(basePocket)
+                                        .font(.caption.monospaced())
+                                        .textSelection(.enabled)
+                                    Text("手机开启 Tailscale 后扫码即可添加到主屏幕，令牌通过 URL #fragment 本地保存，不出公网。")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                            }
+                        }
+                    }
+                    .padding(8)
+                }
+
+                GroupBox("入站 Webhook") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 12) {
-                            Toggle("启用入站 HTTP Webhook 服务", isOn: $whEnabled)
+                            Toggle("启用 HTTP 服务", isOn: $whEnabled)
                             Spacer()
                             let st = model.webhookStatus
                             HStack(spacing: 5) {
                                 Circle()
                                     .fill(st.running ? Color.green : (st.enabled ? Color.orange : Color.secondary))
                                     .frame(width: 8, height: 8)
-                                Text(st.running ? "监听中 http://\(st.host):\(st.port)" : (st.errorMessage ?? "未运行"))
+                                Text(st.running ? "http://\(st.host):\(st.port)" : (st.errorMessage ?? "未运行"))
                                     .font(.caption.monospaced())
                                     .foregroundStyle(.secondary)
                             }
-                            Button("应用端口配置") {
+                            Button("应用") {
                                 applyWebhookConfig()
                             }
                             .buttonStyle(.borderedProminent)
@@ -1151,7 +1254,7 @@ private struct WebhooksAndSecretsPane: View {
                     .padding(8)
                 }
 
-                GroupBox("出站 Webhook 快速连通性测试（Bianzhong 主动推送给飞书 / Bark / Slack 等）") {
+                GroupBox("出站测试") {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
                             Picker("预设格式", selection: $testPreset) {
@@ -1202,10 +1305,10 @@ private struct WebhooksAndSecretsPane: View {
                     .padding(8)
                 }
 
-                GroupBox("安全密钥中心（本地 0600 隔离存储，不进 Git，解决 GUI 应用读不到 ~/.zshrc 变量的问题）") {
+                GroupBox("密钥") {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 6) {
-                            Text("常用变量名快捷填入：")
+                            Text("快捷填入：")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                             ForEach(["BIANZHONG_WEBHOOK_URL", "FEISHU_BOT_SECRET", "BIANZHONG_DECISION_API_KEY"], id: \.self) { presetKey in
@@ -1316,10 +1419,10 @@ private struct RunsAndWorktreesPane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("运行账本与隔离 Worktree")
+                Text("运行")
                     .font(.title2.bold())
                 Spacer()
-                Text("今日运行：\(model.todayRunsCount) 次 · 今日花费：$\(String(format: "%.3f", model.todayCostUSD))")
+                Text("今日 \(model.todayRunsCount) 次 · $\(String(format: "%.3f", model.todayCostUSD))")
                     .font(.caption.monospaced())
                     .padding(.horizontal, 10)
                     .padding(.vertical, 4)
@@ -1333,12 +1436,39 @@ private struct RunsAndWorktreesPane: View {
                 .controlSize(.small)
             }
 
-            GroupBox("隔离 Git Worktree 管理 (Phase 2 产物)") {
+            if !model.activeRuns.isEmpty {
+                GroupBox("正在运行 (\(model.activeRuns.count))") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(model.activeRuns) { run in
+                            HStack(spacing: 8) {
+                                Circle()
+                                    .fill(run.status == "warm_hold" ? Color.orange : Color.cyan)
+                                    .frame(width: 7, height: 7)
+                                Text(run.chimeID)
+                                    .font(.caption.bold())
+                                Text("\(run.driver) · \(run.currentActivity)")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                Button("中止") {
+                                    _ = model.orchestrator.stopRun(id: run.runID)
+                                    model.refreshConsoleData()
+                                }
+                                .controlSize(.mini)
+                            }
+                        }
+                    }
+                    .padding(6)
+                }
+            }
+
+            GroupBox("Worktree") {
                 if model.worktrees.isEmpty {
-                    Text("当前没有活跃的隔离 Worktree 目录")
+                    Text("暂无 Worktree")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .frame(maxWidth: .infinity, minHeight: 40)
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(model.worktrees) { wt in
@@ -1367,6 +1497,17 @@ private struct RunsAndWorktreesPane: View {
                                     )
                                 }
                                 .controlSize(.mini)
+                                if !TerminalLauncher.installedIDEs.isEmpty {
+                                    Menu("IDE ↗") {
+                                        ForEach(TerminalLauncher.installedIDEs) { ide in
+                                            Button(ide.displayName) {
+                                                _ = TerminalLauncher.openInIDE(ide, directory: wt.path)
+                                            }
+                                        }
+                                    }
+                                    .controlSize(.mini)
+                                    .frame(width: 64)
+                                }
                                 if !wt.isDirty {
                                     Button("移除") {
                                         try? model.orchestrator.removeWorktree(at: wt.path)
@@ -1398,7 +1539,7 @@ private struct RunsAndWorktreesPane: View {
                 }
             }
 
-            Text("最近 Agent 运行记录")
+            Text("最近记录")
                 .font(.subheadline.bold())
 
             List(model.recentRuns) { run in
@@ -1436,6 +1577,21 @@ private struct RunsAndWorktreesPane: View {
 }
 
 // MARK: - Local UI Helpers
+
+private func makeQRCodeImage(from string: String, size: CGFloat = 136) -> NSImage? {
+    guard !string.isEmpty,
+          let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+    filter.setValue(Data(string.utf8), forKey: "inputMessage")
+    filter.setValue("M", forKey: "inputCorrectionLevel")
+    guard let output = filter.outputImage else { return nil }
+    let scaleX = size / max(output.extent.size.width, 1)
+    let scaleY = size / max(output.extent.size.height, 1)
+    let transformed = output.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+    let rep = NSCIImageRep(ciImage: transformed)
+    let img = NSImage(size: NSSize(width: size, height: size))
+    img.addRepresentation(rep)
+    return img
+}
 
 private func pickFolder() -> String? {
     let panel = NSOpenPanel()

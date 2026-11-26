@@ -4,11 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-RAW_VERSION="${1:-${VERSION:-0.4.0}}"
+RAW_VERSION="${1:-${VERSION:-0.5.0}}"
 CLEAN_VERSION="${RAW_VERSION#v}"
 PKG_VERSION="$(echo "$CLEAN_VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*$/\1/')"
 if [[ ! "$PKG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  PKG_VERSION="0.4.0"
+  PKG_VERSION="0.5.0"
 fi
 
 ARCH="${BIANZHONG_ARCH:-arm64}"

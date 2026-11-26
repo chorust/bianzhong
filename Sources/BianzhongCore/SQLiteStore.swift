@@ -20,6 +20,45 @@ public struct ApprovalRecord: Codable, Sendable, Equatable, Identifiable {
     public let userComment: String?
     public let createdAt: Int64
     public let resolvedAt: Int64?
+    public let diffPreview: String?
+
+    public init(
+        id: String,
+        runID: String,
+        eventID: String,
+        sessionID: String?,
+        chimeID: String,
+        kind: String,
+        riskLevel: String,
+        title: String,
+        provenanceSummary: String,
+        proposedAction: String,
+        targetRepo: String?,
+        externalSessionID: String?,
+        status: String,
+        userComment: String?,
+        createdAt: Int64,
+        resolvedAt: Int64?,
+        diffPreview: String? = nil
+    ) {
+        self.id = id
+        self.runID = runID
+        self.eventID = eventID
+        self.sessionID = sessionID
+        self.chimeID = chimeID
+        self.kind = kind
+        self.riskLevel = riskLevel
+        self.title = title
+        self.provenanceSummary = provenanceSummary
+        self.proposedAction = proposedAction
+        self.targetRepo = targetRepo
+        self.externalSessionID = externalSessionID
+        self.status = status
+        self.userComment = userComment
+        self.createdAt = createdAt
+        self.resolvedAt = resolvedAt
+        self.diffPreview = diffPreview
+    }
 }
 
 public struct RunRecord: Codable, Sendable, Equatable, Identifiable {
@@ -693,9 +732,9 @@ public final class SQLiteStore: @unchecked Sendable {
         let sql = """
         INSERT INTO approvals (
             id, run_id, event_id, session_id, chime_id, kind, risk_level,
-            title, provenance_summary, proposed_action, target_repo,
+            title, provenance_summary, proposed_action, diff_preview, target_repo,
             external_session_id, status, user_comment, created_at, resolved_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         try runStatement(sql) { stmt in
             self.bindText(stmt, 1, record.id)
@@ -708,15 +747,16 @@ public final class SQLiteStore: @unchecked Sendable {
             self.bindText(stmt, 8, record.title)
             self.bindText(stmt, 9, record.provenanceSummary)
             self.bindText(stmt, 10, record.proposedAction)
-            self.bindOptionalText(stmt, 11, record.targetRepo)
-            self.bindOptionalText(stmt, 12, record.externalSessionID)
-            self.bindText(stmt, 13, record.status)
-            self.bindOptionalText(stmt, 14, record.userComment)
-            sqlite3_bind_int64(stmt, 15, record.createdAt)
+            self.bindOptionalText(stmt, 11, record.diffPreview)
+            self.bindOptionalText(stmt, 12, record.targetRepo)
+            self.bindOptionalText(stmt, 13, record.externalSessionID)
+            self.bindText(stmt, 14, record.status)
+            self.bindOptionalText(stmt, 15, record.userComment)
+            sqlite3_bind_int64(stmt, 16, record.createdAt)
             if let resolvedAt = record.resolvedAt {
-                sqlite3_bind_int64(stmt, 16, resolvedAt)
+                sqlite3_bind_int64(stmt, 17, resolvedAt)
             } else {
-                sqlite3_bind_null(stmt, 16)
+                sqlite3_bind_null(stmt, 17)
             }
         }
     }
@@ -729,7 +769,7 @@ public final class SQLiteStore: @unchecked Sendable {
         let sql = """
         SELECT id, run_id, event_id, session_id, chime_id, kind, risk_level,
                title, provenance_summary, proposed_action, target_repo,
-               external_session_id, status, user_comment, created_at, resolved_at
+               external_session_id, status, user_comment, created_at, resolved_at, diff_preview
         FROM approvals WHERE status = 'pending'
         ORDER BY created_at DESC LIMIT ?;
         """
@@ -755,7 +795,7 @@ public final class SQLiteStore: @unchecked Sendable {
         let sql = """
         SELECT id, run_id, event_id, session_id, chime_id, kind, risk_level,
                title, provenance_summary, proposed_action, target_repo,
-               external_session_id, status, user_comment, created_at, resolved_at
+               external_session_id, status, user_comment, created_at, resolved_at, diff_preview
         FROM approvals WHERE id = ? LIMIT 1;
         """
         var stmt: OpaquePointer?
@@ -796,7 +836,7 @@ public final class SQLiteStore: @unchecked Sendable {
             let selectSQL = """
             SELECT id, run_id, event_id, session_id, chime_id, kind, risk_level,
                    title, provenance_summary, proposed_action, target_repo,
-                   external_session_id, status, user_comment, created_at, resolved_at
+                   external_session_id, status, user_comment, created_at, resolved_at, diff_preview
             FROM approvals WHERE id = ? AND status IN ('pending', 'deferred') LIMIT 1;
             """
             var selStmt: OpaquePointer?
@@ -1205,7 +1245,7 @@ public final class SQLiteStore: @unchecked Sendable {
         let sql = """
         SELECT id, run_id, event_id, session_id, chime_id, kind, risk_level,
                title, provenance_summary, proposed_action, target_repo,
-               external_session_id, status, user_comment, created_at, resolved_at
+               external_session_id, status, user_comment, created_at, resolved_at, diff_preview
         FROM approvals WHERE status = 'deferred' AND kind = 'digest'
         ORDER BY created_at ASC LIMIT ?;
         """
@@ -1379,7 +1419,9 @@ public final class SQLiteStore: @unchecked Sendable {
     }
 
     private func readApprovalRow(_ stmt: OpaquePointer?) -> ApprovalRecord {
-        ApprovalRecord(
+        let colCount = sqlite3_column_count(stmt)
+        let diff = colCount > 16 ? columnText(stmt, 16) : nil
+        return ApprovalRecord(
             id: columnText(stmt, 0) ?? "",
             runID: columnText(stmt, 1) ?? "",
             eventID: columnText(stmt, 2) ?? "",
@@ -1395,7 +1437,8 @@ public final class SQLiteStore: @unchecked Sendable {
             status: columnText(stmt, 12) ?? "pending",
             userComment: columnText(stmt, 13),
             createdAt: sqlite3_column_int64(stmt, 14),
-            resolvedAt: sqlite3_column_type(stmt, 15) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 15)
+            resolvedAt: sqlite3_column_type(stmt, 15) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 15),
+            diffPreview: diff
         )
     }
 }
